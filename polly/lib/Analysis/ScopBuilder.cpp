@@ -19,6 +19,7 @@
 #include "polly/ScopInfo.h"
 #include "polly/Support/GICHelper.h"
 #include "polly/Support/ISLTools.h"
+#include "polly/Support/OffsetFusion.h"
 #include "polly/Support/SCEVValidator.h"
 #include "polly/Support/ScopHelper.h"
 #include "polly/Support/VirtualInstruction.h"
@@ -65,6 +66,8 @@ using namespace polly;
 #define DEBUG_TYPE "polly-scops"
 
 STATISTIC(ScopFound, "Number of valid Scops");
+STATISTIC(NumLogicalOffsets,
+          "Number of statements with a recovered logical offset");
 STATISTIC(RichScopFound, "Number of Scops containing a loop");
 STATISTIC(InfeasibleScops,
           "Number of SCoPs with statically infeasible context.");
@@ -3863,9 +3866,62 @@ void ScopBuilder::buildScop(Region &R, AssumptionCache &AC) {
     return;
   }
 
+  buildLogicalOffsets();
+
 #ifndef NDEBUG
   verifyUses(scop.get(), LI, DT);
 #endif
+}
+
+void ScopBuilder::buildLogicalOffsets() {
+  if (!PollyForceOffsetFusion)
+    return;
+
+  for (ScopStmt &Stmt : *scop) {
+    // Non-affine subregions have no single access function per access.
+    if (Stmt.isRegionStmt())
+      continue;
+    isl::set Domain = Stmt.getDomain();
+    if (unsignedFromIslSize(Domain.tuple_dim()) != 1)
+      continue;
+
+    // The common offset of all array accesses of one kind. Accesses of
+    // scalars are ignored; they do not describe the processed range. Use the
+    // original accesses: later passes (e.g. DeLICM) may map scalars to array
+    // elements, which does not change the source range. Returns std::nullopt
+    // if the accesses have no common offset and sets Found if there is at
+    // least one access of this kind.
+    auto GetCommonOffset = [&](bool Writes,
+                               bool &Found) -> std::optional<int64_t> {
+      std::optional<int64_t> Common;
+      Found = false;
+      for (MemoryAccess *MA : Stmt) {
+        if (!MA->isOriginalArrayKind() || MA->isWrite() != Writes)
+          continue;
+        Found = true;
+        if (!MA->isAffine())
+          return std::nullopt;
+        std::optional<int64_t> Offset =
+            getOffsetFromAccess(Domain, MA->getOriginalAccessRelation());
+        if (!Offset || (Common && *Common != *Offset))
+          return std::nullopt;
+        Common = Offset;
+      }
+      return Common;
+    };
+
+    // Writes determine the offset; reads are only used if there are no array
+    // writes.
+    bool HasWrites;
+    std::optional<int64_t> Offset = GetCommonOffset(/*Writes=*/true, HasWrites);
+    if (!HasWrites) {
+      bool HasReads;
+      Offset = GetCommonOffset(/*Writes=*/false, HasReads);
+    }
+    Stmt.setLogicalOffset(Offset);
+    if (Offset)
+      NumLogicalOffsets++;
+  }
 }
 
 ScopBuilder::ScopBuilder(Region *R, AssumptionCache &AC, AAResults &AA,

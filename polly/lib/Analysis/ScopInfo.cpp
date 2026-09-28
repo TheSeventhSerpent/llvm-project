@@ -23,6 +23,7 @@
 #include "polly/Support/GICHelper.h"
 #include "polly/Support/ISLOStream.h"
 #include "polly/Support/ISLTools.h"
+#include "polly/Support/OffsetFusion.h"
 #include "polly/Support/SCEVAffinator.h"
 #include "polly/Support/SCEVValidator.h"
 #include "polly/Support/ScopHelper.h"
@@ -1288,6 +1289,12 @@ isl::set ScopStmt::getDomain() const { return Domain; }
 
 isl::space ScopStmt::getDomainSpace() const { return Domain.get_space(); }
 
+isl::set ScopStmt::getLogicalDomain() const {
+  if (!LogicalOffset || Domain.is_null())
+    return {};
+  return shiftDomain(Domain, *LogicalOffset);
+}
+
 isl::id ScopStmt::getDomainId() const { return Domain.get_tuple_id(); }
 
 void ScopStmt::printInstructions(raw_ostream &OS) const {
@@ -1314,6 +1321,14 @@ void ScopStmt::print(raw_ostream &OS, bool PrintInstructions) const {
     OS.indent(16) << getScheduleStr() << ";\n";
   } else
     OS.indent(16) << "n/a\n";
+
+  if (PollyForceOffsetFusion) {
+    OS.indent(12) << "LogicalOffset := ";
+    if (LogicalOffset)
+      OS << *LogicalOffset << ";\n";
+    else
+      OS << "n/a;\n";
+  }
 
   for (MemoryAccess *Access : MemAccs)
     Access->print(OS);

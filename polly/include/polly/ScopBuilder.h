@@ -719,6 +719,14 @@ class ScopBuilder final {
   /// Construct the schedule of this SCoP.
   void buildSchedule();
 
+  /// Recover the logical offset of every one-dimensional statement from its
+  /// affine array accesses (-polly-force-offset-fusion only).
+  ///
+  /// The offset is taken from the array write accesses, or from the array
+  /// read accesses if there are no array writes. A statement gets no offset if
+  /// any considered access has no constant offset or if they disagree.
+  void buildLogicalOffsets();
+
   /// A loop stack element to keep track of per-loop information during
   ///        schedule construction.
   using LoopStackElementTy = struct LoopStackElement {

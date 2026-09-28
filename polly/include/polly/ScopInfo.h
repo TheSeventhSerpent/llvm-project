@@ -30,6 +30,7 @@
 #include "isl/isl-noexceptions.h"
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <forward_list>
 #include <list>
 #include <optional>
@@ -1203,6 +1204,12 @@ private:
   /// instance.
   isl::set Domain;
 
+  /// Constant logical offset δ of a one-dimensional statement, such that
+  /// logical index = physical iterator + δ. Only computed with
+  /// -polly-force-offset-fusion, and only if all considered affine array
+  /// accesses agree. std::nullopt means unknown.
+  std::optional<int64_t> LogicalOffset;
+
   /// The memory accesses of this statement.
   ///
   /// The only side effects of a statement are its memory accesses.
@@ -1283,6 +1290,22 @@ public:
   ///
   /// @return The id of the iteration domain space
   isl::id getDomainId() const;
+
+  /// Get the logical offset of this statement, if known.
+  std::optional<int64_t> getLogicalOffset() const { return LogicalOffset; }
+
+  /// Set the logical offset of this statement.
+  void setLogicalOffset(std::optional<int64_t> Offset) {
+    LogicalOffset = Offset;
+  }
+
+  /// Get the iteration domain shifted by the logical offset.
+  ///
+  /// This is only used to compare statements; it never describes the
+  /// statement's execution.
+  ///
+  /// @return The logical domain, or a null set if the offset is unknown.
+  isl::set getLogicalDomain() const;
 
   /// Get an isl string representing this domain.
   std::string getDomainStr() const;
