@@ -22,6 +22,7 @@
 #include "polly/Options.h"
 #include "polly/ScopInfo.h"
 #include "polly/Support/ISLTools.h"
+#include "polly/Support/PollyDebug.h"
 #include "polly/Support/SCEVValidator.h"
 #include "polly/Support/ScopHelper.h"
 #include "polly/Support/VirtualInstruction.h"
@@ -1525,6 +1526,8 @@ Value *IslNodeBuilder::createRTC(isl_ast_expr *Condition) {
   // runtime library calls that are not available on all systems (e.g., Android)
   // and consequently will result in linker errors.
   if (ExprBuilder.hasLargeInts(isl::manage_copy(Condition))) {
+    POLLY_DEBUG(dbgs() << "Run-time check has integers larger than 64 bit, "
+                          "optimized code will not be executed\n");
     isl_ast_expr_free(Condition);
     return Builder.getFalse();
   }

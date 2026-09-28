@@ -93,15 +93,26 @@ bool IslExprBuilder::hasLargeInts(isl::ast_expr Expr) {
     isl::val Val = Expr.get_val();
     APInt APValue = APIntFromVal(Val);
     auto BitWidth = APValue.getBitWidth();
-    return BitWidth >= 64;
+    // Signed values of up to 64 bits are created as i64 constants.
+    return BitWidth > 64;
   }
 
   assert(Type == isl_ast_expr_op && "Expected isl_ast_expr of type operation");
 
   int NumArgs = isl_ast_expr_get_op_n_arg(Expr.get());
 
+  // A wider integer literal that is a direct operand of a comparison is fine:
+  // the other operand is still computed in i64 (with overflow tracking in run
+  // time checks) and only sign-extended for the comparison. A plain icmp on a
+  // wide type never needs a runtime library call. Such comparisons appear in
+  // no-overflow assumptions, e.g. 4 * n + ptr >= 2^63.
+  isl_ast_op_type OpType = isl_ast_expr_get_op_type(Expr.get());
+  bool IsCmp = OpType >= isl_ast_op_eq && OpType <= isl_ast_op_gt;
+
   for (int i = 0; i < NumArgs; i++) {
     isl::ast_expr Operand = Expr.get_op_arg(i);
+    if (IsCmp && isl_ast_expr_get_type(Operand.get()) == isl_ast_expr_int)
+      continue;
     if (hasLargeInts(Operand))
       return true;
   }

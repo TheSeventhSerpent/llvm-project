@@ -185,10 +185,13 @@ public:
 
   /// Check if an @p Expr contains integer constants larger than 64 bit.
   ///
+  /// Such constants are allowed as direct operands of comparisons, where they
+  /// only widen the comparison itself but not any arithmetic.
+  ///
   /// @param Expr The expression to check.
   ///
   /// @return True if the ast expression is larger than 64 bit.
-  bool hasLargeInts(isl::ast_expr Expr);
+  static bool hasLargeInts(isl::ast_expr Expr);
 
 private:
   Scop &S;
