@@ -69,6 +69,7 @@ add_llvm_pass_plugin(Polly
   Support/SCEVValidator.cpp
   Support/RegisterPasses.cpp
   Support/ScopHelper.cpp
+  Support/OffsetFusion.cpp
   Support/ScopLocation.cpp
   Support/ISLTools.cpp
   Support/DumpModulePass.cpp

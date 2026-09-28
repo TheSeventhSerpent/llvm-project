@@ -55,6 +55,7 @@
 #include "polly/ScopInfo.h"
 #include "polly/Support/ISLOStream.h"
 #include "polly/Support/ISLTools.h"
+#include "polly/Support/OffsetFusion.h"
 #include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
@@ -107,6 +108,54 @@ static cl::opt<bool>
     GreedyFusion("polly-loopfusion-greedy",
                  cl::desc("Aggressively try to fuse everything"), cl::Hidden,
                  cl::cat(PollyCategory));
+
+// Options for offset-aware fusion, declared in polly/Support/OffsetFusion.h.
+bool polly::PollyForceOffsetFusion;
+static cl::opt<bool, true> XPollyForceOffsetFusion(
+    "polly-force-offset-fusion",
+    cl::desc("Experimental: fuse loops whose iteration domains differ by "
+             "constant offsets"),
+    cl::location(PollyForceOffsetFusion), cl::init(false),
+    cl::cat(PollyCategory));
+
+bool polly::PollyOffsetFusionProximity;
+static cl::opt<bool, true> XPollyOffsetFusionProximity(
+    "polly-offset-fusion-proximity",
+    cl::desc("Offset-aware fusion: add offset-based proximity relations to "
+             "the scheduler input"),
+    cl::location(PollyOffsetFusionProximity), cl::init(true), cl::Hidden,
+    cl::cat(PollyCategory));
+
+bool polly::PollyOffsetFusionShift;
+static cl::opt<bool, true> XPollyOffsetFusionShift(
+    "polly-offset-fusion-shift",
+    cl::desc("Offset-aware fusion: allow greedy fusion with a constant "
+             "schedule shift"),
+    cl::location(PollyOffsetFusionShift), cl::init(true), cl::Hidden,
+    cl::cat(PollyCategory));
+
+bool polly::PollyOffsetFusionIsolate;
+static cl::opt<bool, true> XPollyOffsetFusionIsolate(
+    "polly-offset-fusion-isolate",
+    cl::desc("Offset-aware fusion: isolate the common interior of fused "
+             "loops"),
+    cl::location(PollyOffsetFusionIsolate), cl::init(true), cl::Hidden,
+    cl::cat(PollyCategory));
+
+unsigned polly::PollyOffsetFusionMaxShift;
+static cl::opt<unsigned, true> XPollyOffsetFusionMaxShift(
+    "polly-offset-fusion-max-shift",
+    cl::desc("Offset-aware fusion: maximal absolute schedule shift"),
+    cl::location(PollyOffsetFusionMaxShift), cl::init(4), cl::Hidden,
+    cl::cat(PollyCategory));
+
+unsigned polly::PollyOffsetFusionMaxStmts;
+static cl::opt<unsigned, true> XPollyOffsetFusionMaxStmts(
+    "polly-offset-fusion-max-stmts",
+    cl::desc("Offset-aware fusion: maximal number of statements for the "
+             "pairwise proximity computation"),
+    cl::location(PollyOffsetFusionMaxStmts), cl::init(64), cl::Hidden,
+    cl::cat(PollyCategory));
 
 static cl::opt<std::string> OuterCoincidence(
     "polly-opt-outer-coincidence",
