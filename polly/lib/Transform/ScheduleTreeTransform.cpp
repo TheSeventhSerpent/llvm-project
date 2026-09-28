@@ -778,6 +778,30 @@ static isl::union_pw_aff shiftSchedule(const isl::union_pw_aff &Sched,
       isl::union_pw_aff(Sched.domain(), isl::val(Sched.ctx(), (long)Shift)));
 }
 
+/// Is fusing after shifting @p RHSOuter by @p Shift allowed and legal?
+static bool isLegalShift(const isl::union_pw_aff &LHSOuter,
+                         const isl::union_pw_aff &RHSOuter,
+                         const isl::union_map &Deps,
+                         const GreedyFusionOptions &Opts,
+                         std::optional<int64_t> Shift) {
+  return Shift && *Shift != 0 && (uint64_t)std::abs(*Shift) <= Opts.MaxShift &&
+         canFuseOutermost(LHSOuter, shiftSchedule(RHSOuter, *Shift), Deps);
+}
+
+/// Return the shift of @p RHSOuter that aligns both loops by their statements'
+/// logical indices, if the logical offsets are known.
+static std::optional<int64_t> getLogicalShift(const isl::union_pw_aff &LHSOuter,
+                                              const isl::union_pw_aff &RHSOuter,
+                                              const GreedyFusionOptions &Opts) {
+  std::optional<int64_t> LHSMisalign =
+      getLogicalMisalignment(LHSOuter, Opts.GetLogicalOffset);
+  std::optional<int64_t> RHSMisalign =
+      getLogicalMisalignment(RHSOuter, Opts.GetLogicalOffset);
+  if (!LHSMisalign || !RHSMisalign)
+    return std::nullopt;
+  return *LHSMisalign - *RHSMisalign;
+}
+
 /// Find a constant shift Δ != 0 of @p RHSOuter such that the loops can be fused
 /// (offset-aware fusion).
 ///
@@ -788,25 +812,14 @@ static isl::union_pw_aff shiftSchedule(const isl::union_pw_aff &Sched,
 static std::optional<int64_t> computeScheduleShift(
     const isl::union_pw_aff &LHSOuter, const isl::union_pw_aff &RHSOuter,
     const isl::union_map &Deps, const GreedyFusionOptions &Opts) {
-  auto IsLegal = [&](std::optional<int64_t> Shift) {
-    return Shift && *Shift != 0 &&
-           (uint64_t)std::abs(*Shift) <= Opts.MaxShift &&
-           canFuseOutermost(LHSOuter, shiftSchedule(RHSOuter, *Shift), Deps);
-  };
-
-  std::optional<int64_t> LHSMisalign =
-      getLogicalMisalignment(LHSOuter, Opts.GetLogicalOffset);
-  std::optional<int64_t> RHSMisalign =
-      getLogicalMisalignment(RHSOuter, Opts.GetLogicalOffset);
-  if (LHSMisalign && RHSMisalign) {
-    int64_t LogicalShift = *LHSMisalign - *RHSMisalign;
-    if (IsLegal(LogicalShift))
-      return LogicalShift;
-  }
+  std::optional<int64_t> LogicalShift =
+      getLogicalShift(LHSOuter, RHSOuter, Opts);
+  if (isLegalShift(LHSOuter, RHSOuter, Deps, Opts, LogicalShift))
+    return LogicalShift;
 
   std::optional<int64_t> DepShift =
       getMinimalLegalShift(LHSOuter, RHSOuter, Deps);
-  if (IsLegal(DepShift))
+  if (isLegalShift(LHSOuter, RHSOuter, Deps, Opts, DepShift))
     return DepShift;
 
   return std::nullopt;
@@ -838,8 +851,23 @@ static isl::schedule tryGreedyFuse(isl::schedule_node_band LHS,
   isl::union_pw_aff RHSPartOuterSched = RHS.get_partial_schedule().get_at(0);
 
   int64_t Shift = 0;
-  if (!canFuseOutermost(LHSPartOuterSched, RHSPartOuterSched, Deps)) {
-    if (!Opts.AllowShift || !OneDimensional)
+  bool CanShift = Opts.AllowShift && OneDimensional;
+
+  // Optionally align the loops by their logical indices even if they could be
+  // fused without a shift.
+  if (CanShift && Opts.PreferAligned) {
+    std::optional<int64_t> LogicalShift =
+        getLogicalShift(LHSPartOuterSched, RHSPartOuterSched, Opts);
+    if (isLegalShift(LHSPartOuterSched, RHSPartOuterSched, Deps, Opts,
+                     LogicalShift)) {
+      Shift = *LogicalShift;
+      RHSPartOuterSched = shiftSchedule(RHSPartOuterSched, Shift);
+    }
+  }
+
+  if (Shift == 0 &&
+      !canFuseOutermost(LHSPartOuterSched, RHSPartOuterSched, Deps)) {
+    if (!CanShift)
       return {};
     std::optional<int64_t> MaybeShift =
         computeScheduleShift(LHSPartOuterSched, RHSPartOuterSched, Deps, Opts);

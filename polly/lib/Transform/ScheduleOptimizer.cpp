@@ -110,6 +110,12 @@ static cl::opt<bool>
                  cl::desc("Aggressively try to fuse everything"), cl::Hidden,
                  cl::cat(PollyCategory));
 
+static cl::opt<bool> OffsetFusionPreferAligned(
+    "polly-offset-fusion-prefer-aligned",
+    cl::desc("Offset-aware fusion (experiment): align fused loops by their "
+             "logical indices even if they could be fused without a shift"),
+    cl::init(false), cl::Hidden, cl::cat(PollyCategory));
+
 static cl::opt<bool> OffsetFusionUnserialize(
     "polly-offset-fusion-unserialize",
     cl::desc("Offset-aware fusion (experiment): do not let isl serialize "
@@ -1025,6 +1031,7 @@ static void runIslScheduleOptimizerImpl(
     GreedyFusionOptions Opts;
     if (OffsetFusion) {
       Opts.AllowShift = PollyOffsetFusionShift;
+      Opts.PreferAligned = OffsetFusionPreferAligned;
       Opts.MarkFused = true;
       // Unless all loops are to be fused, keep loop nests (e.g. tileable ones)
       // as they are; offset-aware fusion targets one-dimensional loops.

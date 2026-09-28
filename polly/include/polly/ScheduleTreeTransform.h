@@ -289,6 +289,11 @@ struct GreedyFusionOptions {
   /// loops, independent of this option.
   bool OnlyOneDimensional = false;
 
+  /// Align loops by their logical indices (see getLogicalMisalignment) even if
+  /// they could be fused without a shift. Otherwise, a shift is only used if
+  /// fusing without one is illegal. Requires AllowShift.
+  bool PreferAligned = false;
+
   /// Maximal absolute value of a shift.
   unsigned MaxShift = 0;
 
