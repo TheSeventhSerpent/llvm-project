@@ -134,6 +134,41 @@ TEST(OffsetFusion, areShiftCompatible) {
   isl_ctx_free(Ctx);
 }
 
+TEST(OffsetFusion, getOffsetProximity) {
+  isl_ctx *Ctx = allocAbortingCtx();
+
+  {
+    isl::set Context(Ctx, "[N] -> { : N >= 0 }");
+    // Loops over [0, N), [1, N) and [0, N - 1) with physical iterators.
+    isl::set S0(Ctx, "[N] -> { S0[i] : 0 <= i < N }");
+    isl::set S1(Ctx, "[N] -> { S1[i] : 0 <= i < N - 1 }");
+    isl::set S2(Ctx, "[N] -> { S2[i] : 0 <= i < N - 1 }");
+
+    // S0[i] and S1[i - 1] process logical index i.
+    isl::map R01 = getOffsetProximity(S0, 0, S1, 1, Context);
+    EXPECT_TRUE(R01.is_equal(
+        isl::map(Ctx, "[N] -> { S0[i] -> S1[i - 1] : 1 <= i < N }")));
+
+    isl::map R02 = getOffsetProximity(S0, 0, S2, 0, Context);
+    EXPECT_TRUE(R02.is_equal(
+        isl::map(Ctx, "[N] -> { S0[i] -> S2[i] : 0 <= i < N - 1 }")));
+
+    isl::map R12 = getOffsetProximity(S1, 1, S2, 0, Context);
+    EXPECT_TRUE(R12.is_equal(
+        isl::map(Ctx, "[N] -> { S1[i] -> S2[i + 1] : 0 <= i < N - 2 }")));
+  }
+
+  {
+    // Not shift-compatible: the upper bounds differ by N.
+    isl::set Context(Ctx, "[N] -> { : N >= 0 }");
+    isl::set A(Ctx, "[N] -> { A[i] : 0 <= i < 2N }");
+    isl::set B(Ctx, "[N] -> { B[i] : 0 <= i < N }");
+    EXPECT_TRUE(getOffsetProximity(A, 0, B, 0, Context).is_null());
+  }
+
+  isl_ctx_free(Ctx);
+}
+
 TEST(OffsetFusion, getMinimalLegalShift) {
   isl_ctx *Ctx = allocAbortingCtx();
 

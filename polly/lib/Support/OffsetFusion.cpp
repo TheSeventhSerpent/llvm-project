@@ -144,6 +144,23 @@ bool polly::areShiftCompatible(isl::set LogA, isl::set LogB, isl::set Context) {
   return !LogA.reset_tuple_id().intersect(LogB.reset_tuple_id()).is_empty();
 }
 
+isl::map polly::getOffsetProximity(isl::set SrcDomain, int64_t SrcOffset,
+                                   isl::set DstDomain, int64_t DstOffset,
+                                   isl::set Context) {
+  if (SrcDomain.is_null() || DstDomain.is_null() || Context.is_null())
+    return {};
+  if (!areShiftCompatible(shiftDomain(SrcDomain, SrcOffset),
+                          shiftDomain(DstDomain, DstOffset), Context))
+    return {};
+
+  // Src[k] processes logical index k + SrcOffset, which Dst processes in
+  // iteration k + SrcOffset - DstOffset. Restricting the relation to both
+  // domains restricts it to the logical indices processed by both.
+  isl::map Rel = physicalToLogical(SrcDomain.get_space(), SrcOffset - DstOffset)
+                     .set_range_tuple(DstDomain.get_tuple_id());
+  return Rel.intersect_domain(SrcDomain).intersect_range(DstDomain);
+}
+
 std::optional<int64_t> polly::getMinimalLegalShift(isl::union_pw_aff LHSOuter,
                                                    isl::union_pw_aff RHSOuter,
                                                    isl::union_map Deps) {

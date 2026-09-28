@@ -57,6 +57,7 @@
 #include "polly/Support/ISLTools.h"
 #include "polly/Support/OffsetFusion.h"
 #include "llvm/ADT/Sequence.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Support/CommandLine.h"
@@ -108,6 +109,12 @@ static cl::opt<bool>
     GreedyFusion("polly-loopfusion-greedy",
                  cl::desc("Aggressively try to fuse everything"), cl::Hidden,
                  cl::cat(PollyCategory));
+
+static cl::opt<bool> OffsetFusionUnserialize(
+    "polly-offset-fusion-unserialize",
+    cl::desc("Offset-aware fusion (experiment): do not let isl serialize "
+             "strongly connected components when rescheduling"),
+    cl::init(false), cl::Hidden, cl::cat(PollyCategory));
 
 // Options for offset-aware fusion, declared in polly/Support/OffsetFusion.h.
 bool polly::PollyForceOffsetFusion;
@@ -276,6 +283,8 @@ STATISTIC(RegisterTileOpts, "Number of register tiling applied");
 STATISTIC(PrevectOpts, "Number of strip-mining for prevectorization applied");
 STATISTIC(MatMulOpts,
           "Number of matrix multiplication patterns detected and optimized");
+STATISTIC(NumOffsetProximity,
+          "Number of statement pairs linked by offset proximity");
 
 namespace {
 /// Additional parameters of the schedule optimizer.
@@ -757,6 +766,72 @@ static void walkScheduleTreeForStatistics(isl::schedule Schedule, int Version) {
       &Version);
 }
 
+/// Return the fixed leading values of the first point of @p Stmt in the
+/// original schedule, up to the first value that is not a constant.
+static SmallVector<int64_t, 4> getFirstTimeKey(const isl::union_map &Schedule,
+                                               ScopStmt &Stmt) {
+  SmallVector<int64_t, 4> Key;
+  isl::union_set Times =
+      Schedule.intersect_domain(isl::union_set(Stmt.getDomain())).range();
+  if (Times.is_null() || Times.is_empty())
+    return Key;
+  isl::set First = isl::set(Times).lexmin();
+  for (unsigned I : rangeIslSize(0, First.tuple_dim())) {
+    isl::val V = First.plain_get_val_if_fixed(isl::dim::set, I);
+    if (V.is_null() || !V.is_int())
+      break;
+    Key.push_back(V.get_num_si());
+  }
+  return Key;
+}
+
+/// Build the offset proximity relations (Algorithm 1) between all pairs of
+/// statements with a logical offset, directed in original execution order.
+///
+/// { Src[k] -> Dst[k'] } relates instances that process the same logical
+/// index, such that the scheduler tries to execute them close to each other,
+/// even if there is no dependence between them.
+static isl::union_map buildOffsetProximity(Scop &S) {
+  isl::union_map Result = isl::union_map::empty(S.getIslCtx());
+
+  SmallVector<ScopStmt *, 8> Stmts;
+  for (ScopStmt &Stmt : S)
+    if (Stmt.getLogicalOffset())
+      Stmts.push_back(&Stmt);
+  if (Stmts.size() < 2 || Stmts.size() > PollyOffsetFusionMaxStmts)
+    return Result;
+
+  // Order by the original schedule, not by the statement list, which may
+  // differ from the execution order. Ties keep the statement list order.
+  isl::union_map Schedule = S.getSchedule();
+  if (Schedule.is_null())
+    return Result;
+  SmallVector<std::pair<SmallVector<int64_t, 4>, ScopStmt *>, 8> Keyed;
+  for (ScopStmt *Stmt : Stmts)
+    Keyed.push_back({getFirstTimeKey(Schedule, *Stmt), Stmt});
+  llvm::stable_sort(Keyed, [](const auto &A, const auto &B) {
+    size_t N = std::min(A.first.size(), B.first.size());
+    return std::lexicographical_compare(A.first.begin(), A.first.begin() + N,
+                                        B.first.begin(), B.first.begin() + N);
+  });
+
+  isl::set Context = S.getContext();
+  for (size_t I = 0; I < Keyed.size(); ++I) {
+    for (size_t J = I + 1; J < Keyed.size(); ++J) {
+      ScopStmt *Src = Keyed[I].second;
+      ScopStmt *Dst = Keyed[J].second;
+      isl::map Rel = getOffsetProximity(
+          Src->getDomain(), *Src->getLogicalOffset(), Dst->getDomain(),
+          *Dst->getLogicalOffset(), Context);
+      if (Rel.is_null() || Rel.is_empty())
+        continue;
+      Result = Result.unite(Rel);
+      NumOffsetProximity++;
+    }
+  }
+  return Result;
+}
+
 static void runIslScheduleOptimizerImpl(
     Scop &S,
     function_ref<const Dependences &(Dependences::AnalysisLevel)> GetDeps,
@@ -854,6 +929,12 @@ static void runIslScheduleOptimizerImpl(
     isl::union_map Validity = D.getDependences(ValidityKinds);
     isl::union_map Proximity = D.getDependences(ProximityKinds);
 
+    if (PollyForceOffsetFusion && PollyOffsetFusionProximity) {
+      isl::union_map OffsetProximity = buildOffsetProximity(S);
+      POLLY_DEBUG(dbgs() << "Offset proximity := " << OffsetProximity << ";\n");
+      Proximity = Proximity.unite(OffsetProximity);
+    }
+
     // Simplify the dependences by removing the constraints introduced by the
     // domains. This can speed up the scheduling time significantly, as large
     // constant coefficients will be removed from the dependences. The
@@ -914,10 +995,18 @@ static void runIslScheduleOptimizerImpl(
     SC = SC.set_validity(Validity);
     SC = SC.set_coincidence(Validity);
 
+    // Polly lets isl separate strongly connected components as soon as they are
+    // detected, which prevents isl from fusing loops with a shift on its own.
+    int OldSerializeSCCs = isl_options_get_schedule_serialize_sccs(Ctx);
+    if (PollyForceOffsetFusion && OffsetFusionUnserialize)
+      isl_options_set_schedule_serialize_sccs(Ctx, 0);
+
     {
       IslQuotaScope MaxOpScope = MaxOpGuard.enter();
       Schedule = SC.compute_schedule();
     }
+
+    isl_options_set_schedule_serialize_sccs(Ctx, OldSerializeSCCs);
 
     isl_options_set_on_error(Ctx, OnErrorStatus);
 

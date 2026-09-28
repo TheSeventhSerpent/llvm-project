@@ -76,6 +76,19 @@ isl::set shiftDomain(isl::set Domain, int64_t Delta);
 /// must overlap. Tuple ids are ignored.
 bool areShiftCompatible(isl::set LogA, isl::set LogB, isl::set Context);
 
+/// Build the offset proximity relation between two statements.
+///
+/// Relates the instances of @p SrcDomain and @p DstDomain that process the same
+/// logical index, expressed on the physical instances:
+///   { Src[k] -> Dst[k + SrcOffset - DstOffset] }
+/// restricted to both domains, i.e. to the shared logical range.
+///
+/// @return The relation, or a null map if the logical domains are not
+///         shift-compatible (see areShiftCompatible).
+isl::map getOffsetProximity(isl::set SrcDomain, int64_t SrcOffset,
+                            isl::set DstDomain, int64_t DstOffset,
+                            isl::set Context);
+
 /// Compute the smallest shift Δ >= 0 such that scheduling the RHS instances at
 /// @p RHSOuter + Δ does not execute any dependence target before its source
 /// scheduled at @p LHSOuter.
