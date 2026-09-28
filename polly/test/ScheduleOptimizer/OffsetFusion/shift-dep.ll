@@ -55,6 +55,7 @@ for.body5:
 ; CHECK:        mark: "Offset-aware fusion"
 ; CHECK-NEXT:   child:
 ; CHECK-NEXT:     schedule: "[n] -> [{ Stmt_for_body5[i0] -> [(1 + i0)]; Stmt_for_body[i0] -> [(i0)] }]"
+; CHECK-NEXT:     options: "[n] -> { isolate{{\[\[}}] -> [i0]] : 0 < i0 < n; atomic[0] }"
 ; CHECK-NEXT:     child:
 ; CHECK-NEXT:       sequence:
 ; CHECK-NEXT:       - filter: "[n] -> { Stmt_for_body[i0] }"

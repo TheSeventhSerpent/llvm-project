@@ -306,6 +306,18 @@ struct GreedyFusionOptions {
 isl::schedule applyGreedyFusion(isl::schedule Sched, const isl::union_map &Deps,
                                 const GreedyFusionOptions &Opts = {});
 
+/// Isolate the common interior of loops fused by offset-aware fusion.
+///
+/// For every band below a mark named OffsetFusionMarkName, compute the
+/// iterations in which all fused loop bodies are executed and set the AST
+/// build options such that these are generated as a separate loop without
+/// conditions. The remaining iterations (prologue and epilogue) are generated
+/// as atomic loops.
+///
+/// Setting the isolate option anchors the tree, so this must be the last
+/// modification of the schedule tree.
+isl::schedule isolateOffsetFusedBands(isl::schedule Sched);
+
 } // namespace polly
 
 #endif // POLLY_SCHEDULETREETRANSFORM_H

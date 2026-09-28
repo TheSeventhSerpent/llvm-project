@@ -1,12 +1,11 @@
-; RUN: opt %loadNPMPolly -polly-force-offset-fusion -polly-reschedule=0 -polly-postopts=0 '-passes=polly-custom<opt-isl>' -polly-print-opt-isl -disable-output < %s | FileCheck %s
-; RUN: opt %loadNPMPolly -polly-force-offset-fusion -polly-reschedule=1 -polly-postopts=0 '-passes=polly-custom<opt-isl>' -polly-print-opt-isl -disable-output < %s | FileCheck %s
-; RUN: opt %loadNPMPolly -polly-force-offset-fusion -polly-offset-fusion-shift=0 -polly-reschedule=0 -polly-postopts=0 '-passes=polly-custom<opt-isl>' -polly-print-opt-isl -disable-output < %s | FileCheck %s --check-prefix=NOSHIFT
-; RUN: opt %loadNPMPolly -polly-force-offset-fusion -polly-offset-fusion-shift=0 -polly-reschedule=1 -polly-postopts=0 '-passes=polly-custom<opt-isl>' -polly-print-opt-isl -disable-output < %s | FileCheck %s --check-prefix=NOSHIFT
-; RUN: opt %loadNPMPolly -polly-reschedule=0 -polly-postopts=0 '-passes=polly-custom<opt-isl>' -polly-print-opt-isl -disable-output < %s | FileCheck %s --check-prefix=OFF
+; RUN: opt %loadNPMPolly -polly-force-offset-fusion '-passes=polly-custom<opt-isl;ast>' -polly-print-ast -disable-output < %s | FileCheck %s
+; RUN: opt %loadNPMPolly -polly-force-offset-fusion -polly-offset-fusion-isolate=0 '-passes=polly-custom<opt-isl;ast>' -polly-print-ast -disable-output < %s | FileCheck %s --check-prefix=NOISO
+; RUN: opt %loadNPMPolly -polly-force-offset-fusion '-passes=polly-custom<opt-isl;ast;codegen>' -S < %s | FileCheck %s --check-prefix=CODEGEN
 ;
-; Offset-aware fusion of loops over [0, n), [1, n) and [0, n - 1). The second
-; loop is shifted by one iteration, which aligns all three loops by the element
-; index they process. The third loop is then fused without a shift.
+; After offset-aware fusion of loops over [0, n), [1, n) and [0, n - 1), all
+; three loop bodies are executed in the iterations 1 <= c0 < n - 1. These are
+; generated as a loop without conditions. The other iterations form a prologue
+; and an epilogue.
 ;
 ; void chain(int n, float *restrict A, float *restrict B, float *restrict C,
 ;            float *restrict D) {
@@ -76,33 +75,40 @@ for.body19:
   br i1 %exitcond61.not, label %for.cond.cleanup18, label %for.body19
 }
 
-; CHECK:      Calculated schedule:
-; CHECK-NEXT: domain: "[n] -> { Stmt_for_body7[i0] : 0 <= i0 <= -2 + n; Stmt_for_body[i0] : 0 <= i0 < n; Stmt_for_body19[i0] : 0 <= i0 <= -2 + n }"
-; CHECK-NEXT: child:
-; CHECK-NEXT:   mark: "Offset-aware fusion"
-; CHECK-NEXT:   child:
-; CHECK-NEXT:     schedule: "[n] -> [{ Stmt_for_body19[i0] -> [(i0)]; Stmt_for_body7[i0] -> [(1 + i0)]; Stmt_for_body[i0] -> [(i0)] }]"
-; CHECK-NEXT:     options: "[n] -> { isolate{{\[\[}}] -> [i0]] : 0 < i0 <= -2 + n; atomic[0] }"
-; CHECK-NEXT:     child:
-; CHECK-NEXT:       sequence:
-; CHECK-NEXT:       - filter: "[n] -> { Stmt_for_body[i0] }"
-; CHECK-NEXT:       - filter: "[n] -> { Stmt_for_body7[i0] }"
-; CHECK-NEXT:       - filter: "[n] -> { Stmt_for_body19[i0] }"
+; CHECK:      // Offset-aware fusion
+; CHECK-NEXT: {
+; CHECK-NEXT:   if (n >= 3) {
+; CHECK-NEXT:     Stmt_for_body(0);
+; CHECK-NEXT:     Stmt_for_body19(0);
+; CHECK-NEXT:   }
+; CHECK-NEXT:   for (int c0 = 1; c0 < n - 1; c0 += 1) {
+; CHECK-NEXT:     Stmt_for_body(c0);
+; CHECK-NEXT:     Stmt_for_body7(c0 - 1);
+; CHECK-NEXT:     Stmt_for_body19(c0);
+; CHECK-NEXT:   }
+; CHECK-NEXT:   if (n >= 3) {
+; CHECK-NEXT:     Stmt_for_body(n - 1);
+; CHECK-NEXT:     Stmt_for_body7(n - 2);
+; CHECK-NEXT:   } else {
+; CHECK-NEXT:     for (int c0 = 0; c0 < n; c0 += 1) {
+; CHECK-NEXT:       Stmt_for_body(c0);
+; CHECK-NEXT:       if (n == 2 && c0 == 1) {
+; CHECK-NEXT:         Stmt_for_body7(0);
+; CHECK-NEXT:       } else if (n == 2) {
+; CHECK-NEXT:         Stmt_for_body19(0);
+; CHECK-NEXT:       }
+; CHECK-NEXT:     }
+; CHECK-NEXT:   }
+; CHECK-NEXT: }
 
-; Without shifts, only the last two loops can be fused.
-; NOSHIFT:      Calculated schedule:
-; NOSHIFT:        sequence:
-; NOSHIFT-NEXT:   - filter: "[n] -> { Stmt_for_body[i0] }"
-; NOSHIFT:        - filter: "[n] -> { Stmt_for_body19[i0]; Stmt_for_body7[i0] }"
-; NOSHIFT-NEXT:     child:
-; NOSHIFT-NEXT:       mark: "Offset-aware fusion"
-; NOSHIFT-NEXT:       child:
-; NOSHIFT-NEXT:         schedule: "[n] -> [{ Stmt_for_body19[i0] -> [(i0)]; Stmt_for_body7[i0] -> [(i0)] }]"
-; NOSHIFT-NEXT:         child:
-; NOSHIFT-NEXT:           sequence:
-; NOSHIFT-NEXT:           - filter: "[n] -> { Stmt_for_body7[i0] }"
-; NOSHIFT-NEXT:           - filter: "[n] -> { Stmt_for_body19[i0] }"
+; NOISO:      // Offset-aware fusion
+; NOISO-NEXT: for (int c0 = 0; c0 < n; c0 += 1) {
+; NOISO-NEXT:   Stmt_for_body(c0);
+; NOISO-NEXT:   if (c0 >= 1)
+; NOISO-NEXT:     Stmt_for_body7(c0 - 1);
+; NOISO-NEXT:   if (n >= c0 + 2)
+; NOISO-NEXT:     Stmt_for_body19(c0);
+; NOISO-NEXT: }
 
-; Without -polly-force-offset-fusion, nothing is fused.
-; OFF:      Calculated schedule:
-; OFF-NEXT: n/a
+; CODEGEN: br i1 %polly.rtc.result, label %polly.start
+; CODEGEN: polly.stmt.for.body:

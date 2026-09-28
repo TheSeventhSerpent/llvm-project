@@ -12,6 +12,7 @@
 
 #include "polly/ScheduleTreeTransform.h"
 #include "polly/Support/GICHelper.h"
+#include "polly/Support/ISLOStream.h"
 #include "polly/Support/ISLTools.h"
 #include "polly/Support/ScopHelper.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -27,6 +28,7 @@
 
 STATISTIC(NumPlainFusions, "Number of greedy fusions without shift");
 STATISTIC(NumShiftedFusions, "Number of greedy fusions with a constant shift");
+STATISTIC(NumIsolatedBands, "Number of fused bands with isolated interior");
 
 using namespace polly;
 using namespace llvm;
@@ -1233,6 +1235,66 @@ isl::set polly::getPartialTilePrefixes(isl::set ScheduleRange,
   BadPrefixes = BadPrefixes.project_out(isl::dim::set, Dims - 1, 1);
   LoopPrefixes = LoopPrefixes.project_out(isl::dim::set, Dims - 1, 1);
   return LoopPrefixes.subtract(BadPrefixes);
+}
+
+/// Isolate the common interior of the loops fused into @p Band, whose child
+/// is a sequence with one filter per fused loop body.
+static isl::schedule_node isolateInterior(isl::schedule_node_band Band) {
+  isl::schedule_node Seq = Band.child(0);
+
+  // { Domain[] -> [prefix..., band] }, including the band's own dimension.
+  isl::union_map PrefixSched = Seq.get_prefix_schedule_relation();
+
+  // Iterations in which any or all of the fused loop bodies are executed.
+  isl::set Full, Common;
+  unsigned NumParts = 0;
+  for (unsigned C : rangeIslSize(0, Seq.n_children())) {
+    isl::schedule_node Child = Seq.child(C);
+    if (!Child.isa<isl::schedule_node_filter>())
+      return Band;
+    isl::union_set Filter = Child.as<isl::schedule_node_filter>().get_filter();
+    isl::union_set Range = PrefixSched.intersect_domain(Filter).range();
+    if (Range.is_empty())
+      continue;
+    isl::set Part = isl::set(Range).coalesce();
+    Full = NumParts ? Full.unite(Part) : Part;
+    Common = NumParts ? Common.intersect(Part) : Part;
+    NumParts++;
+  }
+  if (NumParts < 2)
+    return Band;
+  Full = Full.coalesce();
+  Common = Common.coalesce();
+  if (Common.is_empty() || Common.is_equal(Full))
+    return Band;
+
+  POLLY_DEBUG(dbgs() << "Isolating the common interior " << Common
+                     << " of an offset-fused band\n");
+
+  isl::union_set Options = getIsolateOptions(Common, 1)
+                               .unite(getDimOptions(Band.ctx(), "atomic"))
+                               .unite(Band.get_ast_build_options());
+  NumIsolatedBands++;
+  return Band.set_ast_build_options(Options);
+}
+
+isl::schedule polly::isolateOffsetFusedBands(isl::schedule Sched) {
+  if (Sched.is_null())
+    return {};
+
+  isl::schedule_node Root = Sched.get_root().map_descendant_bottom_up(
+      [](isl::schedule_node Node) -> isl::schedule_node {
+        if (!isOffsetFusionMark(Node))
+          return Node;
+        isl::schedule_node Band = Node.child(0);
+        if (!Band.isa<isl::schedule_node_band>() ||
+            unsignedFromIslSize(
+                Band.as<isl::schedule_node_band>().n_member()) != 1 ||
+            !Band.child(0).isa<isl::schedule_node_sequence>())
+          return Node;
+        return isolateInterior(Band.as<isl::schedule_node_band>()).parent();
+      });
+  return Root.get_schedule();
 }
 
 isl::union_set polly::getIsolateOptions(isl::set IsolateDomain,

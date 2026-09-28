@@ -1058,6 +1058,14 @@ static void runIslScheduleOptimizerImpl(
     walkScheduleTreeForStatistics(Schedule, 2);
   }
 
+  // Isolating the interior anchors the schedule tree, so this must be the last
+  // modification.
+  if (OffsetFusion && PollyOffsetFusionIsolate && !Schedule.is_null()) {
+    Schedule = isolateOffsetFusedBands(Schedule);
+    POLLY_DEBUG(
+        printSchedule(dbgs(), Schedule, "After isolating offset-fused bands"));
+  }
+
   // Check for why any computation could have failed
   if (MaxOpGuard.hasQuotaExceeded()) {
     POLLY_DEBUG(dbgs() << "Schedule optimizer calculation exceeds ISL quota\n");

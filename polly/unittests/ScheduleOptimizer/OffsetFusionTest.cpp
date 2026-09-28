@@ -8,6 +8,7 @@
 
 #include "polly/Support/OffsetFusion.h"
 #include "polly/ScheduleTreeTransform.h"
+#include "polly/Support/GICHelper.h"
 #include "gtest/gtest.h"
 #include "isl/ctx.h"
 #include "isl/options.h"
@@ -310,6 +311,51 @@ TEST(OffsetFusion, applyGreedyFusionWithShift) {
     // Without shifting, the loops are not fused.
     Fused = applyGreedyFusion(Sched, Deps, GreedyFusionOptions());
     EXPECT_TRUE(Fused.get_map().is_equal(Sched.get_map()));
+  }
+
+  isl_ctx_free(Ctx);
+}
+
+TEST(OffsetFusion, isolateOffsetFusedBands) {
+  isl_ctx *Ctx = allocAbortingCtx();
+
+  {
+    // The diploma example after offset-aware fusion.
+    auto MakeSched = [&](bool HasMark, const char *Domain) {
+      std::string Band =
+          "{ schedule: \"[n] -> [{ S0[i] -> [(i)]; S1[i] -> [(i + 1)]; S2[i] "
+          "-> [(i)] }]\", child: { sequence: [ { filter: \"{ S0[i] }\" }, { "
+          "filter: \"{ S1[i] }\" }, { filter: \"{ S2[i] }\" } ] } }";
+      if (HasMark)
+        Band = "{ mark: \"Offset-aware fusion\", child: " + Band + " }";
+      return isl::schedule(Ctx, std::string("{ domain: \"") + Domain +
+                                    "\", child: " + Band + " }");
+    };
+    const char *Shifted = "[n] -> { S0[i] : 0 <= i < n; S1[i] : 0 <= i < n - "
+                          "1; S2[i] : 0 <= i < n - 1 }";
+    auto GetOptions = [](isl::schedule Sched, bool HasMark) {
+      isl::schedule_node Band = Sched.get_root().child(0);
+      if (HasMark)
+        Band = Band.child(0);
+      return Band.as<isl::schedule_node_band>().get_ast_build_options();
+    };
+
+    // All loop bodies are executed in 1 <= i <= n - 2.
+    isl::schedule Isolated = isolateOffsetFusedBands(MakeSched(true, Shifted));
+    isl::union_set Expected(
+        Ctx, "[n] -> { isolate[[] -> [i]] : 1 <= i <= n - 2; atomic[0] }");
+    EXPECT_TRUE(GetOptions(Isolated, true).is_equal(Expected))
+        << stringFromIslObj(GetOptions(Isolated, true));
+
+    // Bands without the mark are not changed.
+    isl::schedule Unmarked = isolateOffsetFusedBands(MakeSched(false, Shifted));
+    EXPECT_TRUE(GetOptions(Unmarked, false).is_empty());
+
+    // Nothing to isolate if all bodies are executed in all iterations.
+    isl::schedule Equal = isolateOffsetFusedBands(MakeSched(
+        true, "[n] -> { S0[i] : 1 <= i < n - 1; S1[i] : 0 <= i < n - 2; "
+              "S2[i] : 1 <= i < n - 1 }"));
+    EXPECT_TRUE(GetOptions(Equal, true).is_empty());
   }
 
   isl_ctx_free(Ctx);
