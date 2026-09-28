@@ -905,8 +905,10 @@ public:
         ChangedDirectChildren.insert(Bands[i + 1].second.get());
 
       // Collapse the neigbros to a single new candidate that could be fused
-      // with the next candidate.
-      Bands[i] = {Fused.get_root(), {}};
+      // with the next candidate. The root of the fused schedule is its domain
+      // node; the candidate must be the band below it, otherwise tryGreedyFuse
+      // rejects it and fusion stops after the first pair.
+      Bands[i] = {Fused.get_root().child(0), {}};
       Bands.erase(Bands.begin() + i + 1);
 
       AnyChange = true;
