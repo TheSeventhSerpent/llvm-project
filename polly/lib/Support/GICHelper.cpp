@@ -63,13 +63,14 @@ APInt polly::APIntFromVal(__isl_take isl_val *Val) {
 
   // As isl provides only an interface to obtain data that describes the
   // absolute value of an isl_val, A at this point always contains a positive
-  // number. In case Val was originally negative, we expand the size of A by
-  // one and negate the value (in two's complement representation). As a result,
+  // number. We expand the size of A by one, such that its value stays positive
+  // when interpreted as signed number, even if the most significant bit of the
+  // last chunk is set (e.g. for 2^63). In case Val was originally negative, we
+  // then negate the value (in two's complement representation). As a result,
   // the new value in A corresponds now with Val.
-  if (isl_val_is_neg(Val)) {
-    A = A.zext(A.getBitWidth() + 1);
+  A = A.zext(A.getBitWidth() + 1);
+  if (isl_val_is_neg(Val))
     A = -A;
-  }
 
   // isl may represent small numbers with more than the minimal number of bits.
   // We truncate the APInt to the minimal number of bits needed to represent the

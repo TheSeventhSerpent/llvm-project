@@ -239,6 +239,45 @@ TEST(Isl, IslValToAPInt) {
   }
 
   {
+    auto IslMax = isl::val(IslCtx, 63).pow2().sub(1);
+    auto APMax = APIntFromVal(IslMax);
+    EXPECT_TRUE(APMax.isMaxSignedValue());
+    EXPECT_EQ(64u, APMax.getBitWidth());
+  }
+
+  {
+    auto IslMin = isl::val(IslCtx, 63).pow2().neg();
+    auto APMin = APIntFromVal(IslMin);
+    EXPECT_TRUE(APMin.isMinSignedValue());
+    EXPECT_EQ(64u, APMin.getBitWidth());
+  }
+
+  {
+    // The most significant bit of the absolute value's only chunk is set.
+    auto IslPow63 = isl::val(IslCtx, 63).pow2();
+    auto APPow63 = APIntFromVal(IslPow63);
+    EXPECT_FALSE(APPow63.isNegative());
+    EXPECT_TRUE(APPow63.isPowerOf2());
+    EXPECT_EQ(65u, APPow63.getBitWidth());
+  }
+
+  {
+    auto IslPow63Plus4 = isl::val(IslCtx, 63).pow2().add(isl::val(IslCtx, 4));
+    auto APPow63Plus4 = APIntFromVal(IslPow63Plus4);
+    EXPECT_FALSE(APPow63Plus4.isNegative());
+    EXPECT_EQ(65u, APPow63Plus4.getBitWidth());
+    EXPECT_EQ(4u, APPow63Plus4.trunc(63).getZExtValue());
+  }
+
+  {
+    auto IslUMax = isl::val(IslCtx, 64).pow2().sub(1);
+    auto APUMax = APIntFromVal(IslUMax);
+    EXPECT_FALSE(APUMax.isNegative());
+    EXPECT_TRUE(APUMax.trunc(64).isAllOnes());
+    EXPECT_EQ(65u, APUMax.getBitWidth());
+  }
+
+  {
     auto IslExp = isl::val(IslCtx, 500);
     auto IslLargePow2 = IslExp.pow2();
     auto APLargePow2 = APIntFromVal(IslLargePow2);
