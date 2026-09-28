@@ -30,6 +30,29 @@ Results go to `results/<timestamp>/` (`--out` to override):
 
 `run.py` exits with status 1 if any check fails.
 
+## Figures
+
+`plot.py` turns a run with benchmarks into figures (PNG and SVG) plus a table
+view (`speedup.csv`), written to `<results>/figures/`. It needs matplotlib,
+installed in a local venv:
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install matplotlib
+.venv/bin/python plot.py                 # newest run in results/
+.venv/bin/python plot.py results/<run> --cache-size 16384 --format png,svg,pdf
+```
+
+| Figure | Content |
+|---|---|
+| `fig1_speedup_vs_size` | speedup over O3 by array size, one panel per kernel (offset, greedy, aligned) |
+| `fig2_speedup_largest` | speedup per kernel at the largest size, offset vs greedy |
+| `fig3_ablation` | every configuration × kernel, cache-resident vs memory-bound size |
+| `fig4_geomean` | geometric-mean speedup per configuration, cache-resident vs memory-bound |
+
+Runs without the performance governor are labeled "Preliminary" in every
+figure. Measurements whose optimized code was not executed are marked, and are
+left out of the geometric means.
+
 ## What is checked
 
 For every kernel and configuration:
