@@ -22,6 +22,7 @@
 
 #include "isl/isl-noexceptions.h"
 #include <cstdint>
+#include <functional>
 #include <optional>
 
 namespace polly {
@@ -88,6 +89,24 @@ bool areShiftCompatible(isl::set LogA, isl::set LogB, isl::set Context);
 isl::map getOffsetProximity(isl::set SrcDomain, int64_t SrcOffset,
                             isl::set DstDomain, int64_t DstOffset,
                             isl::set Context);
+
+/// Callback returning the logical offset of the statement with the given
+/// domain tuple id, if known.
+using LogicalOffsetFn = std::function<std::optional<int64_t>(const isl::id &)>;
+
+/// Compute the logical misalignment of a schedule dimension.
+///
+/// For every statement S, the schedule @p Outer must have the form
+/// θ_S(k) = k + c_S and S must have a logical offset δ_S. The misalignment of S
+/// is m_S = c_S - δ_S, i.e. the schedule time minus the logical index. Two sets
+/// of statements are aligned by their logical index if their misalignments are
+/// equal; shifting one of them by the difference aligns them.
+///
+/// @return The common misalignment of all statements, or std::nullopt if the
+///         statements do not have the required form or disagree.
+std::optional<int64_t>
+getLogicalMisalignment(isl::union_pw_aff Outer,
+                       const LogicalOffsetFn &GetLogicalOffset);
 
 /// Compute the smallest shift Δ >= 0 such that scheduling the RHS instances at
 /// @p RHSOuter + Δ does not execute any dependence target before its source

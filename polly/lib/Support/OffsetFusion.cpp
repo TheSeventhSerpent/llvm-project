@@ -161,6 +161,57 @@ isl::map polly::getOffsetProximity(isl::set SrcDomain, int64_t SrcOffset,
   return Rel.intersect_domain(SrcDomain).intersect_range(DstDomain);
 }
 
+/// If @p PA is k + c for a one-dimensional statement, return c.
+static std::optional<int64_t> getUnitStrideConstant(isl::pw_aff PA) {
+  if (unsignedFromIslSize(PA.n_piece()) != 1)
+    return std::nullopt;
+  isl::aff Aff;
+  PA.foreach_piece([&](isl::set, isl::aff A) -> isl::stat {
+    Aff = A;
+    return isl::stat::ok();
+  });
+  if (Aff.is_null() || unsignedFromIslSize(Aff.dim(isl::dim::in)) != 1 ||
+      unsignedFromIslSize(Aff.dim(isl::dim::div)) != 0)
+    return std::nullopt;
+
+  auto Coeff = [&](isl_dim_type Type, int Pos) {
+    return isl::manage(isl_aff_get_coefficient_val(Aff.get(), Type, Pos));
+  };
+  for (unsigned P = 0; P < unsignedFromIslSize(Aff.dim(isl::dim::param)); ++P)
+    if (!Coeff(isl_dim_param, P).is_zero())
+      return std::nullopt;
+  if (!Coeff(isl_dim_in, 0).is_one())
+    return std::nullopt;
+  return getSmallInt(Aff.constant_val());
+}
+
+std::optional<int64_t>
+polly::getLogicalMisalignment(isl::union_pw_aff Outer,
+                              const LogicalOffsetFn &GetLogicalOffset) {
+  if (Outer.is_null() || !GetLogicalOffset)
+    return std::nullopt;
+
+  std::optional<int64_t> Common;
+  bool Failed = false;
+  Outer.foreach_pw_aff([&](isl::pw_aff PA) -> isl::stat {
+    if (Failed)
+      return isl::stat::ok();
+    std::optional<int64_t> C = getUnitStrideConstant(PA);
+    std::optional<int64_t> Delta;
+    if (isl_pw_aff_has_tuple_id(PA.get(), isl_dim_in) == isl_bool_true)
+      Delta = GetLogicalOffset(
+          isl::manage(isl_pw_aff_get_tuple_id(PA.get(), isl_dim_in)));
+    if (!C || !Delta || (Common && *Common != *C - *Delta))
+      Failed = true;
+    else
+      Common = *C - *Delta;
+    return isl::stat::ok();
+  });
+  if (Failed)
+    return std::nullopt;
+  return Common;
+}
+
 std::optional<int64_t> polly::getMinimalLegalShift(isl::union_pw_aff LHSOuter,
                                                    isl::union_pw_aff RHSOuter,
                                                    isl::union_map Deps) {

@@ -14,6 +14,7 @@
 #define POLLY_SCHEDULETREETRANSFORM_H
 
 #include "polly/Support/ISLTools.h"
+#include "polly/Support/OffsetFusion.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "isl/isl-noexceptions.h"
@@ -273,13 +274,37 @@ isl::schedule_node applyRegisterTiling(isl::schedule_node Node,
                                        llvm::ArrayRef<int> TileSizes,
                                        int DefaultTileSize);
 
+/// Options for applyGreedyFusion. The defaults select plain greedy fusion.
+struct GreedyFusionOptions {
+  /// If two loops cannot be fused directly, try to fuse them after shifting
+  /// the second loop's schedule by a constant (offset-aware fusion).
+  bool AllowShift = false;
+
+  /// Insert a mark named OffsetFusionMarkName above every fused band of
+  /// one-dimensional statements.
+  bool MarkFused = false;
+
+  /// Only fuse loops whose statements are all one-dimensional. Loop nests are
+  /// left alone, e.g. to keep them tileable. Shifts are only tried for such
+  /// loops, independent of this option.
+  bool OnlyOneDimensional = false;
+
+  /// Maximal absolute value of a shift.
+  unsigned MaxShift = 0;
+
+  /// Returns the logical offset of a statement given its domain tuple id. Used
+  /// to align shifted loops by their logical index. May be empty.
+  LogicalOffsetFn GetLogicalOffset;
+};
+
 /// Apply greedy fusion. That is, fuse any loop that is possible to be fused
 /// top-down.
 ///
 /// @param Sched  Sched tree to fuse all the loops in.
 /// @param Deps   Validity constraints that must be preserved.
-isl::schedule applyGreedyFusion(isl::schedule Sched,
-                                const isl::union_map &Deps);
+/// @param Opts   Fusion options.
+isl::schedule applyGreedyFusion(isl::schedule Sched, const isl::union_map &Deps,
+                                const GreedyFusionOptions &Opts = {});
 
 } // namespace polly
 

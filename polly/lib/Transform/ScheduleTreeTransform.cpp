@@ -17,12 +17,16 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/Transforms/Utils/UnrollLoop.h"
 
 #include "polly/Support/PollyDebug.h"
 #define DEBUG_TYPE "polly-opt-isl"
+
+STATISTIC(NumPlainFusions, "Number of greedy fusions without shift");
+STATISTIC(NumShiftedFusions, "Number of greedy fusions with a constant shift");
 
 using namespace polly;
 using namespace llvm;
@@ -728,18 +732,16 @@ static isl::union_map remainigDepsFromSequence(ArrayRef<isl::union_set> Domains,
   return remainingDepsFromPartialSchedule(PartialSchedules, Deps);
 }
 
-/// Determine whether the outermost loop of to bands can be fused while
-/// respecting validity dependencies.
-static bool canFuseOutermost(const isl::schedule_node_band &LHS,
-                             const isl::schedule_node_band &RHS,
+/// Determine whether two loops with the outermost schedules @p LHSOuter and
+/// @p RHSOuter can be fused while respecting validity dependencies.
+static bool canFuseOutermost(const isl::union_pw_aff &LHSOuter,
+                             const isl::union_pw_aff &RHSOuter,
                              const isl::union_map &Deps) {
   // { LHSDomain[] -> Scatter[] }
-  isl::union_map LHSPartSched =
-      LHS.get_partial_schedule().get_at(0).as_union_map();
+  isl::union_map LHSPartSched = LHSOuter.as_union_map();
 
   // { Domain[] -> Scatter[] }
-  isl::union_map RHSPartSched =
-      RHS.get_partial_schedule().get_at(0).as_union_map();
+  isl::union_map RHSPartSched = RHSOuter.as_union_map();
 
   // Dependencies that are already resolved because LHS executes before RHS, but
   // will not be anymore after fusion. { DefDomain[] -> UseDomain[] }
@@ -767,25 +769,94 @@ static bool canFuseOutermost(const isl::schedule_node_band &LHS,
   return WithBefore.is_empty();
 }
 
+/// Return @p Sched + @p Shift.
+static isl::union_pw_aff shiftSchedule(const isl::union_pw_aff &Sched,
+                                       int64_t Shift) {
+  return Sched.add(
+      isl::union_pw_aff(Sched.domain(), isl::val(Sched.ctx(), (long)Shift)));
+}
+
+/// Find a constant shift Δ != 0 of @p RHSOuter such that the loops can be fused
+/// (offset-aware fusion).
+///
+/// First try to align both loops by their statements' logical indices. If that
+/// is not possible or not legal, try the smallest shift that respects all
+/// dependences from LHS to RHS. A shift is only accepted if the fusion is legal
+/// after shifting.
+static std::optional<int64_t> computeScheduleShift(
+    const isl::union_pw_aff &LHSOuter, const isl::union_pw_aff &RHSOuter,
+    const isl::union_map &Deps, const GreedyFusionOptions &Opts) {
+  auto IsLegal = [&](std::optional<int64_t> Shift) {
+    return Shift && *Shift != 0 &&
+           (uint64_t)std::abs(*Shift) <= Opts.MaxShift &&
+           canFuseOutermost(LHSOuter, shiftSchedule(RHSOuter, *Shift), Deps);
+  };
+
+  std::optional<int64_t> LHSMisalign =
+      getLogicalMisalignment(LHSOuter, Opts.GetLogicalOffset);
+  std::optional<int64_t> RHSMisalign =
+      getLogicalMisalignment(RHSOuter, Opts.GetLogicalOffset);
+  if (LHSMisalign && RHSMisalign) {
+    int64_t LogicalShift = *LHSMisalign - *RHSMisalign;
+    if (IsLegal(LogicalShift))
+      return LogicalShift;
+  }
+
+  std::optional<int64_t> DepShift =
+      getMinimalLegalShift(LHSOuter, RHSOuter, Deps);
+  if (IsLegal(DepShift))
+    return DepShift;
+
+  return std::nullopt;
+}
+
+/// Are all statements executed by @p Band one-dimensional?
+static bool isOneDimensional(const isl::schedule_node_band &Band) {
+  bool AllOneDim = true;
+  Band.get_domain().foreach_set([&](isl::set Set) -> isl::stat {
+    if (unsignedFromIslSize(Set.tuple_dim()) != 1)
+      AllOneDim = false;
+    return isl::stat::ok();
+  });
+  return AllOneDim;
+}
+
 /// Fuse @p LHS and @p RHS if possible while preserving validity dependenvies.
 static isl::schedule tryGreedyFuse(isl::schedule_node_band LHS,
                                    isl::schedule_node_band RHS,
-                                   const isl::union_map &Deps) {
-  if (!canFuseOutermost(LHS, RHS, Deps))
+                                   const isl::union_map &Deps,
+                                   const GreedyFusionOptions &Opts) {
+  bool OneDimensional = isOneDimensional(LHS) && isOneDimensional(RHS);
+  if (Opts.OnlyOneDimensional && !OneDimensional)
     return {};
-
-  POLLY_DEBUG({
-    dbgs() << "Found loops for greedy fusion:\n";
-    dumpIslObj(LHS, dbgs());
-    dbgs() << "and\n";
-    dumpIslObj(RHS, dbgs());
-    dbgs() << "\n";
-  });
 
   // The partial schedule of the bands outermost loop that we need to combine
   // for the fusion.
   isl::union_pw_aff LHSPartOuterSched = LHS.get_partial_schedule().get_at(0);
   isl::union_pw_aff RHSPartOuterSched = RHS.get_partial_schedule().get_at(0);
+
+  int64_t Shift = 0;
+  if (!canFuseOutermost(LHSPartOuterSched, RHSPartOuterSched, Deps)) {
+    if (!Opts.AllowShift || !OneDimensional)
+      return {};
+    std::optional<int64_t> MaybeShift =
+        computeScheduleShift(LHSPartOuterSched, RHSPartOuterSched, Deps, Opts);
+    if (!MaybeShift)
+      return {};
+    Shift = *MaybeShift;
+    RHSPartOuterSched = shiftSchedule(RHSPartOuterSched, Shift);
+  }
+
+  POLLY_DEBUG({
+    dbgs() << "Found loops for greedy fusion";
+    if (Shift != 0)
+      dbgs() << " with shift " << Shift;
+    dbgs() << ":\n";
+    dumpIslObj(LHS, dbgs());
+    dbgs() << "and\n";
+    dumpIslObj(RHS, dbgs());
+    dbgs() << "\n";
+  });
 
   // Isolate band bodies as roots of their own schedule trees.
   IdentityRewriter Rewriter;
@@ -812,12 +883,42 @@ static isl::schedule tryGreedyFuse(isl::schedule_node_band LHS,
   isl::schedule NewCommonSchedule = NewCommonBody.insert_partial_schedule(
       NewCommonPartialSched.as_multi_union_pw_aff());
 
+  // Mark the fused band, e.g. to isolate the common interior of the fused
+  // loops later. Loop nests are not marked; a mark would keep their bands from
+  // being collapsed.
+  if (Opts.MarkFused && OneDimensional)
+    NewCommonSchedule =
+        NewCommonSchedule.get_root()
+            .child(0)
+            .insert_mark(isl::id::alloc(NewCommonSchedule.ctx(),
+                                        OffsetFusionMarkName, nullptr))
+            .get_schedule();
+
+  if (Shift != 0)
+    NumShiftedFusions++;
+  else
+    NumPlainFusions++;
   return NewCommonSchedule;
+}
+
+/// Is @p Node a mark inserted by greedy fusion (see
+/// GreedyFusionOptions::MarkFused)?
+static bool isOffsetFusionMark(const isl::schedule_node &Node) {
+  return isMark(Node) && Node.as<isl::schedule_node_mark>().get_id().name() ==
+                             OffsetFusionMarkName;
 }
 
 static isl::schedule tryGreedyFuse(isl::schedule_node LHS,
                                    isl::schedule_node RHS,
-                                   const isl::union_map &Deps) {
+                                   const isl::union_map &Deps,
+                                   const GreedyFusionOptions &Opts) {
+  // A band fused before can be fused again. Its mark is dropped; the result
+  // gets a new one.
+  if (isOffsetFusionMark(LHS))
+    LHS = LHS.child(0);
+  if (isOffsetFusionMark(RHS))
+    RHS = RHS.child(0);
+
   // TODO: Non-bands could be interpreted as a band with just as single
   // iteration. However, this is only useful if both ends of a fused loop were
   // originally loops themselves.
@@ -827,7 +928,7 @@ static isl::schedule tryGreedyFuse(isl::schedule_node LHS,
     return {};
 
   return tryGreedyFuse(LHS.as<isl::schedule_node_band>(),
-                       RHS.as<isl::schedule_node_band>(), Deps);
+                       RHS.as<isl::schedule_node_band>(), Deps, Opts);
 }
 
 /// Fuse all fusable loop top-down in a schedule tree.
@@ -842,8 +943,13 @@ private:
   const BaseTy &getBase() const { return *this; }
 
 public:
+  GreedyFusionRewriter(const GreedyFusionOptions &Opts) : Opts(Opts) {}
+
   /// Is set to true if anything has been fused.
   bool AnyChange = false;
+
+  /// Fusion options.
+  const GreedyFusionOptions &Opts;
 
   isl::schedule visitBand(isl::schedule_node_band Band, isl::union_map Deps) {
     // { Domain[] -> Scatter[] }
@@ -891,7 +997,7 @@ public:
     int i = 0;
     while (i + 1 < (int)Bands.size()) {
       isl::schedule Fused =
-          tryGreedyFuse(Bands[i].first, Bands[i + 1].first, Deps);
+          tryGreedyFuse(Bands[i].first, Bands[i + 1].first, Deps, Opts);
       if (Fused.is_null()) {
         // Cannot merge this node with the next; look at next pair.
         i += 1;
@@ -906,8 +1012,8 @@ public:
 
       // Collapse the neigbros to a single new candidate that could be fused
       // with the next candidate. The root of the fused schedule is its domain
-      // node; the candidate must be the band below it, otherwise tryGreedyFuse
-      // rejects it and fusion stops after the first pair.
+      // node; the candidate must be the band (or its mark) below it, otherwise
+      // tryGreedyFuse rejects it and fusion stops after the first pair.
       Bands[i] = {Fused.get_root().child(0), {}};
       Bands.erase(Bands.begin() + i + 1);
 
@@ -1235,10 +1341,11 @@ isl::schedule polly::applyMaxFission(isl::schedule_node BandToFission) {
 }
 
 isl::schedule polly::applyGreedyFusion(isl::schedule Sched,
-                                       const isl::union_map &Deps) {
+                                       const isl::union_map &Deps,
+                                       const GreedyFusionOptions &Opts) {
   POLLY_DEBUG(dbgs() << "Greedy loop fusion\n");
 
-  GreedyFusionRewriter Rewriter;
+  GreedyFusionRewriter Rewriter(Opts);
   isl::schedule Result = Rewriter.visit(Sched, Deps);
   if (!Rewriter.AnyChange) {
     POLLY_DEBUG(dbgs() << "Found nothing to fuse\n");

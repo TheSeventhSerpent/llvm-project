@@ -1,13 +1,15 @@
 ; RUN: opt %loadNPMPolly -polly-force-offset-fusion '-passes=polly-custom<opt-isl>' -debug-only=polly-opt-isl -disable-output < %s 2>&1 | FileCheck %s --check-prefix=DEBUG
-; RUN: opt %loadNPMPolly -polly-force-offset-fusion -polly-offset-fusion-unserialize -polly-postopts=0 '-passes=polly-custom<opt-isl;ast>' -polly-print-ast -disable-output < %s | FileCheck %s --check-prefix=FUSED
-; RUN: opt %loadNPMPolly -polly-force-offset-fusion -polly-offset-fusion-unserialize -polly-offset-fusion-proximity=0 -polly-postopts=0 '-passes=polly-custom<opt-isl;ast>' -polly-print-ast -disable-output < %s | FileCheck %s --check-prefix=SEPARATE
-; RUN: opt %loadNPMPolly -polly-force-offset-fusion -polly-postopts=0 '-passes=polly-custom<opt-isl;ast>' -polly-print-ast -disable-output < %s | FileCheck %s --check-prefix=SEPARATE
+; RUN: opt %loadNPMPolly -polly-force-offset-fusion -polly-offset-fusion-unserialize '-passes=polly-custom<opt-isl>' -debug-only=polly-opt-isl -disable-output < %s 2>&1 | FileCheck %s --check-prefix=FUSED
+; RUN: opt %loadNPMPolly -polly-force-offset-fusion -polly-offset-fusion-unserialize -polly-offset-fusion-proximity=0 '-passes=polly-custom<opt-isl>' -debug-only=polly-opt-isl -disable-output < %s 2>&1 | FileCheck %s --check-prefix=SEPARATE
+; RUN: opt %loadNPMPolly -polly-force-offset-fusion '-passes=polly-custom<opt-isl>' -debug-only=polly-opt-isl -disable-output < %s 2>&1 | FileCheck %s --check-prefix=SEPARATE
 ; REQUIRES: asserts
 ;
 ; Two loops without any dependence between them read the same array at
 ; logical offsets 0 and 1. Offset proximity is the only relation between them.
 ; If isl does not serialize strongly connected components, it uses the
-; relation to fuse the loops, aligned by their logical index.
+; relation to fuse the loops, aligned by their logical index. (Greedy fusion,
+; which runs afterwards, would otherwise fuse them without a shift; only isl's
+; rescheduling result is checked here.)
 ;
 ; void g(long n, float *restrict A, float *restrict B, float *restrict C) {
 ;   for (long i = 0; i < n; i++) B[i] = A[i] * 2;
@@ -52,13 +54,15 @@ for.body6:
 ; DEBUG: Offset proximity := [n] -> { Stmt_for_body[i0] -> Stmt_for_body6[-1 + i0] : 0 < i0 < n };
 ; DEBUG: Validity := [n] -> {  };
 
-; FUSED:      for (int c0 = 0; c0 < n; c0 += 1) {
-; FUSED-NEXT:   Stmt_for_body(c0);
-; FUSED-NEXT:   if (c0 >= 1)
-; FUSED-NEXT:     Stmt_for_body6(c0 - 1);
-; FUSED-NEXT: }
+; FUSED:      After rescheduling:
+; FUSED-NEXT: domain: "[n] -> { Stmt_for_body6[i0] : 0 <= i0 <= -2 + n; Stmt_for_body[i0] : 0 <= i0 < n }"
+; FUSED-NEXT: child:
+; FUSED-NEXT:   schedule: "[n] -> [{ Stmt_for_body6[i0] -> [(1 + i0)]; Stmt_for_body[i0] -> [(i0)] }]"
 
-; SEPARATE:      for (int c0 = 0; c0 < n; c0 += 1)
-; SEPARATE-NEXT:   Stmt_for_body(c0);
-; SEPARATE:      for (int c0 = 0; c0 < n - 1; c0 += 1)
-; SEPARATE-NEXT:   Stmt_for_body6(c0);
+; SEPARATE:      After rescheduling:
+; SEPARATE-NEXT: domain: "[n] -> { Stmt_for_body6[i0] : 0 <= i0 <= -2 + n; Stmt_for_body[i0] : 0 <= i0 < n }"
+; SEPARATE-NEXT: child:
+; SEPARATE-NEXT:   {{set|sequence}}:
+; SEPARATE-NEXT:   - filter: "[n] -> { Stmt_for_body[i0] }"
+; SEPARATE-NEXT:     child:
+; SEPARATE-NEXT:       schedule: "[n] -> [{ Stmt_for_body[i0] -> [(i0)] }]"

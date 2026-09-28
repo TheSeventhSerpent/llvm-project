@@ -7,9 +7,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "polly/Support/OffsetFusion.h"
+#include "polly/ScheduleTreeTransform.h"
 #include "gtest/gtest.h"
 #include "isl/ctx.h"
 #include "isl/options.h"
+#include <map>
+#include <string>
 
 using namespace polly;
 
@@ -197,6 +200,116 @@ TEST(OffsetFusion, getMinimalLegalShift) {
     // Reversed access: the required shift grows with n.
     EXPECT_EQ(std::nullopt,
               Shift("[n] -> { S0[i] -> S1[n - 1 - i] : 0 <= i < n }"));
+  }
+
+  isl_ctx_free(Ctx);
+}
+
+/// Logical offsets by statement name.
+LogicalOffsetFn
+offsetsByName(std::map<std::string, std::optional<int64_t>> Offsets) {
+  return [Offsets](const isl::id &Id) -> std::optional<int64_t> {
+    auto It = Offsets.find(Id.name());
+    return It == Offsets.end() ? std::nullopt : It->second;
+  };
+}
+
+TEST(OffsetFusion, getLogicalMisalignment) {
+  isl_ctx *Ctx = allocAbortingCtx();
+
+  {
+    LogicalOffsetFn Offsets = offsetsByName({{"S0", 0}, {"S1", 1}, {"S2", 0}});
+
+    // m = c - δ.
+    EXPECT_EQ(std::optional<int64_t>(0),
+              getLogicalMisalignment(
+                  isl::union_pw_aff(Ctx, "{ S0[i] -> [(i)] }"), Offsets));
+    EXPECT_EQ(std::optional<int64_t>(-1),
+              getLogicalMisalignment(
+                  isl::union_pw_aff(Ctx, "{ S1[i] -> [(i)] }"), Offsets));
+    EXPECT_EQ(std::optional<int64_t>(0),
+              getLogicalMisalignment(
+                  isl::union_pw_aff(Ctx, "{ S1[i] -> [(i + 1)] }"), Offsets));
+
+    // All statements agree.
+    EXPECT_EQ(
+        std::optional<int64_t>(0),
+        getLogicalMisalignment(
+            isl::union_pw_aff(Ctx, "{ S0[i] -> [(i)]; S1[i] -> [(i + 1)] }"),
+            Offsets));
+
+    // Statements disagree.
+    EXPECT_EQ(std::nullopt,
+              getLogicalMisalignment(
+                  isl::union_pw_aff(Ctx, "{ S0[i] -> [(i)]; S1[i] -> [(i)] }"),
+                  Offsets));
+
+    // Not of the form k + c.
+    EXPECT_EQ(std::nullopt,
+              getLogicalMisalignment(
+                  isl::union_pw_aff(Ctx, "{ S0[i] -> [(2i)] }"), Offsets));
+    EXPECT_EQ(
+        std::nullopt,
+        getLogicalMisalignment(
+            isl::union_pw_aff(Ctx, "[n] -> { S0[i] -> [(i + n)] }"), Offsets));
+
+    // Unknown offset.
+    EXPECT_EQ(std::nullopt,
+              getLogicalMisalignment(
+                  isl::union_pw_aff(Ctx, "{ S3[i] -> [(i)] }"), Offsets));
+
+    // No callback.
+    EXPECT_EQ(std::nullopt,
+              getLogicalMisalignment(
+                  isl::union_pw_aff(Ctx, "{ S0[i] -> [(i)] }"), {}));
+  }
+
+  isl_ctx_free(Ctx);
+}
+
+TEST(OffsetFusion, applyGreedyFusionWithShift) {
+  isl_ctx *Ctx = allocAbortingCtx();
+
+  {
+    // Two loops over [0, n) and [0, n - 1). S1[i] depends on S0[i + 1].
+    isl::schedule Sched(
+        Ctx, "{ domain: \"[n] -> { S0[i] : 0 <= i < n; S1[i] : 0 <= i < n - "
+             "1 }\", child: { sequence: [ { filter: \"{ S0[i] }\", child: { "
+             "schedule: \"[n] -> [{ S0[i] -> [(i)] }]\" } }, { filter: \"{ "
+             "S1[i] }\", child: { schedule: \"[n] -> [{ S1[i] -> [(i)] }]\" "
+             "} } ] } }");
+    isl::union_map Deps(Ctx, "[n] -> { S0[i] -> S1[i - 1] : 1 <= i < n }");
+
+    GreedyFusionOptions Opts;
+    Opts.AllowShift = true;
+    Opts.MarkFused = true;
+    Opts.MaxShift = 4;
+
+    // Plain fusion is illegal; the shift is derived from the dependences.
+    isl::schedule Fused = applyGreedyFusion(Sched, Deps, Opts);
+    EXPECT_TRUE(Fused.get_map().is_equal(isl::union_map(
+        Ctx, "[n] -> { S0[i] -> [i, 0]; S1[i] -> [i + 1, 1] }")));
+    isl::schedule_node Mark = Fused.get_root().child(0);
+    ASSERT_EQ(isl_schedule_node_mark, isl_schedule_node_get_type(Mark.get()));
+    EXPECT_EQ(std::string(OffsetFusionMarkName),
+              Mark.as<isl::schedule_node_mark>().get_id().name());
+
+    // Logical alignment takes precedence if it is legal: S1 processes the
+    // logical index i + 2.
+    Opts.GetLogicalOffset = offsetsByName({{"S0", 0}, {"S1", 2}});
+    Fused = applyGreedyFusion(Sched, Deps, Opts);
+    EXPECT_TRUE(Fused.get_map().is_equal(isl::union_map(
+        Ctx, "[n] -> { S0[i] -> [i, 0]; S1[i] -> [i + 2, 1] }")));
+
+    // ... unless the shift is too large.
+    Opts.MaxShift = 1;
+    Fused = applyGreedyFusion(Sched, Deps, Opts);
+    EXPECT_TRUE(Fused.get_map().is_equal(isl::union_map(
+        Ctx, "[n] -> { S0[i] -> [i, 0]; S1[i] -> [i + 1, 1] }")));
+
+    // Without shifting, the loops are not fused.
+    Fused = applyGreedyFusion(Sched, Deps, GreedyFusionOptions());
+    EXPECT_TRUE(Fused.get_map().is_equal(Sched.get_map()));
   }
 
   isl_ctx_free(Ctx);

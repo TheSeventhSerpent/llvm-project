@@ -1017,11 +1017,29 @@ static void runIslScheduleOptimizerImpl(
 
   walkScheduleTreeForStatistics(Schedule, 1);
 
-  if (GreedyFusion && !Schedule.is_null()) {
+  // Offset-aware fusion does not override user-directed transformations.
+  bool OffsetFusion = PollyForceOffsetFusion && !HasUserTransformation;
+  if ((GreedyFusion || OffsetFusion) && !Schedule.is_null()) {
     isl::union_map Validity = D.getDependences(
         Dependences::TYPE_RAW | Dependences::TYPE_WAR | Dependences::TYPE_WAW);
-    Schedule = applyGreedyFusion(Schedule, Validity);
+    GreedyFusionOptions Opts;
+    if (OffsetFusion) {
+      Opts.AllowShift = PollyOffsetFusionShift;
+      Opts.MarkFused = true;
+      // Unless all loops are to be fused, keep loop nests (e.g. tileable ones)
+      // as they are; offset-aware fusion targets one-dimensional loops.
+      Opts.OnlyOneDimensional = !GreedyFusion;
+      Opts.MaxShift = PollyOffsetFusionMaxShift;
+      Opts.GetLogicalOffset = [](const isl::id &Id) -> std::optional<int64_t> {
+        auto *Stmt = static_cast<ScopStmt *>(Id.get_user());
+        if (!Stmt)
+          return std::nullopt;
+        return Stmt->getLogicalOffset();
+      };
+    }
+    Schedule = applyGreedyFusion(Schedule, Validity, Opts);
     assert(!Schedule.is_null());
+    POLLY_DEBUG(printSchedule(dbgs(), Schedule, "After greedy fusion"));
   }
 
   // Apply post-rescheduling optimizations (if enabled) and/or prevectorization.
