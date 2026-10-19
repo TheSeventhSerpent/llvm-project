@@ -15,6 +15,10 @@ upstream.
 
 # Subset, with cache-miss counters:
 ./run.py --kernels k01_shifted,k04_stl3 --configs offset,noiso --perf
+
+# Dense size sweep (1K to 16M, four sizes per octave), three interleaved runs
+# (about 35 minutes):
+./run.py --sizes sweep --runs 3
 ```
 
 It uses `build/bin/clang++` from this repository (`--clang` to override).
@@ -24,7 +28,7 @@ Results go to `results/<timestamp>/` (`--out` to override):
 |---|---|
 | `summary.md` | problems, transformation statistics per kernel and configuration, speedup tables |
 | `correctness.csv` | statistics, Polly code in the IR, sizes at which the optimized code ran, bit-exact match with O3 |
-| `bench.csv` | median and minimum time per kernel, configuration and size |
+| `bench.csv` | median and minimum time per run, kernel, configuration and size |
 | `meta.txt` | compiler, git revision, CPU and governor |
 | `build/` | objects, IR and build logs per kernel and configuration |
 
@@ -48,6 +52,11 @@ python3 -m venv .venv && .venv/bin/pip install matplotlib
 | `fig2_speedup_largest` | speedup per kernel at the largest size, offset vs greedy |
 | `fig3_ablation` | every configuration × kernel, cache-resident vs memory-bound size |
 | `fig4_geomean` | geometric-mean speedup per configuration, cache-resident vs memory-bound |
+| `sweep/<kernel>` | per kernel: O3 time per element, and the speedup of every configuration by array size; dashed lines where the kernel's arrays fill L1/L2/L3; bands for the spread over runs (gray: O3 against itself, i.e. the noise floor; blue: offset) |
+
+The sweep figures are meant for `--sizes sweep --runs 3`: with only a few sizes
+they cannot show jumps between them, and with a single run there is no noise
+band.
 
 Runs without the performance governor are labeled "Preliminary" in every
 figure. Measurements whose optimized code was not executed are marked, and are
@@ -121,3 +130,7 @@ with plain `-O3`, so statistics and run-time checks come only from the kernel.
   all runs of a benchmark, including the untimed input initialization.
 - Each benchmark is the median of `--reps` runs (default 11) after one warm-up
   run. Inputs are re-initialized before every run, outside the timed region.
+- `--runs N` repeats all benchmarks N times. The runs are interleaved, and all
+  configurations of a kernel are measured back to back at each size, so that
+  slow drifts (temperature, frequency) affect O3 and the configurations alike.
+  Tables and figures use the median over the runs.

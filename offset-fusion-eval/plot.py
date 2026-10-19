@@ -11,16 +11,21 @@ table view (speedup.csv) are written to RESULTS_DIR/figures/:
   fig3_ablation          speedup of every configuration, cache-resident vs
                          memory-bound size (heatmaps)
   fig4_geomean           geometric-mean speedup per configuration
+  sweep/<kernel>         per kernel: speedup over O3 by array size for all
+                         configurations, with cache boundaries and the
+                         run-to-run spread (for dense `run.py --sizes sweep`)
 
 Speedup = median time of O3 / median time of the configuration; > 1 is
-faster than O3. Configurations whose optimized code is not executed (the
-kernel falls back to the original code) are marked, and left out of the
+faster than O3. With `run.py --runs N`, the time of each benchmark is the
+median over the N runs. Configurations whose optimized code is not executed
+(the kernel falls back to the original code) are marked, and left out of the
 geometric means.
 """
 import argparse
 import csv
 import math
 import os
+import re
 import statistics
 import sys
 import textwrap
@@ -31,6 +36,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
+from matplotlib.patches import Patch  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -46,7 +52,18 @@ SERIES = {  # Fixed per configuration, never by rank.
     "offset": ("#2a78d6", "o"),
     "greedy": ("#eb6834", "s"),
     "aligned": ("#1baf7a", "D"),
+    "polly": ("#eda100", "v"),
+    "noprox": ("#e87ba4", "^"),
+    "noshift": ("#008300", "P"),
+    "noiso": ("#6250d6", "X"),
+    "unserialize": ("#e34948", "*"),
 }
+# Series of fig1 (the overview), and of the two panels of the per-kernel sweep
+# figures. Each set was checked with the dataviz palette validator (adjacent
+# pairs, light surface): slots 1-4 and slots 1, 5-8 of the reference palette.
+OVERVIEW_SERIES = ("offset", "greedy", "aligned")
+SWEEP_MAIN = ("polly", "greedy", "offset", "aligned")
+SWEEP_ABLATION = ("offset", "noprox", "noshift", "noiso", "unserialize")
 LABELS = {
     "O3": "O3 (no Polly)",
     "polly": "Polly",
@@ -109,17 +126,28 @@ def fmt_size(n):
     return str(n)
 
 
-def load(results):
+def load_runs(results):
+    """{(kernel, config, n): {run: median_ns}} and the metadata. Results without
+    a `run` column (a single run) count as run 0."""
     bench = list(csv.DictReader(open(os.path.join(results, "bench.csv"))))
     meta = {}
     for line in open(os.path.join(results, "meta.txt")):
         k, _, v = line.partition(":")
         meta[k.strip()] = v.strip()
+    times = {}
+    for r in bench:
+        key = (r["kernel"], r["config"], int(r["n"]))
+        times.setdefault(key, {})[int(r.get("run") or 0)] = int(r["median_ns"])
+    ok = {(r["kernel"], r["config"], int(r["n"])): r["polly_path"] != "0" for r in bench}
+    return bench, times, ok, meta
+
+
+def load(results):
+    bench, times, ok, meta = load_runs(results)
     kernels = list(dict.fromkeys(r["kernel"] for r in bench))
     configs = list(dict.fromkeys(r["config"] for r in bench))
     sizes = sorted({int(r["n"]) for r in bench})
-    t = {(r["kernel"], r["config"], int(r["n"])): int(r["median_ns"]) for r in bench}
-    ok = {(r["kernel"], r["config"], int(r["n"])): r["polly_path"] != "0" for r in bench}
+    t = {key: statistics.median(runs.values()) for key, runs in times.items()}
     speedup = {}
     for (k, c, n), v in t.items():
         base = t.get((k, "O3", n))
@@ -128,12 +156,23 @@ def load(results):
     return kernels, configs, sizes, speedup, ok, meta
 
 
+def run_speedups(times, k, c, n):
+    """Speedups over O3 of the individual runs (O3 of the same run)."""
+    base = times.get((k, "O3", n), {})
+    return [base[r] / v for r, v in times.get((k, c, n), {}).items() if r in base and v]
+
+
 def subtitle(meta):
     cpu = meta.get("cpu", "?")
     num, _, model = cpu.partition(" (")
     model = model.rstrip(")").replace("12th Gen Intel(R) Core(TM) ", "")
+    runs = int(meta.get("runs", 1) or 1)
+    reps = f"median of {meta.get('reps', '?')} runs"
+    if runs > 1:
+        reps = f"median of {meta.get('reps', '?')} repetitions, median over {runs} " \
+               f"interleaved runs"
     s = f"{model or '?'}, pinned to CPU {num}, governor {meta.get('governor', '?')}, " \
-        f"median of {meta.get('reps', '?')} runs, commit {meta.get('git', '?')}"
+        f"{reps}, commit {meta.get('git', '?')}"
     if meta.get("governor") != "performance":
         s = "Preliminary (not the performance governor): " + s
     return s
@@ -155,17 +194,37 @@ def save(fig, outdir, name, formats):
     plt.close(fig)
 
 
+def size_ticks(ax, sizes):
+    """Log2 x axis over the array sizes. A dense sweep gets ticks at the powers
+    of four only."""
+    ax.set_xscale("log", base=2)
+    ticks = sizes
+    if len(sizes) > 8:
+        ticks = [1 << e for e in range(0, 40, 2) if sizes[0] <= 1 << e <= sizes[-1]]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([fmt_size(n) for n in ticks])
+    ax.minorticks_off()
+    ax.set_xlim(sizes[0] / 1.15, sizes[-1] * 1.15)
+
+
+def size_range(ns):
+    if len(ns) > 4:
+        return f"{fmt_size(ns[0])}–{fmt_size(ns[-1])}"
+    return ", ".join(fmt_size(n) for n in ns)
+
+
 def log_speedup_axis(ax, lo, hi):
     ax.set_yscale("log", base=2)
-    ticks = [t for t in (0.125, 0.25, 0.5, 1, 2, 4, 8) if lo <= t <= hi]
+    ticks = [t for t in (1 / 32, 1 / 16, 0.125, 0.25, 0.5, 1, 2, 4, 8) if lo <= t <= hi]
     ax.set_yticks(ticks)
-    ax.set_yticklabels([f"{t:g}×" for t in ticks])
+    ax.set_yticklabels([f"{t:g}×" if t >= 0.125 else f"1/{round(1 / t)}×" for t in ticks])
     ax.minorticks_off()
     ax.set_ylim(lo, hi)
 
 
 def fig_speedup_vs_size(kernels, sizes, speedup, ok, meta, outdir, formats):
-    series = [c for c in SERIES if any((k, c, sizes[0]) in speedup for k in kernels)]
+    series = [c for c in OVERVIEW_SERIES if any((k, c, sizes[0]) in speedup for k in kernels)]
+    dense = len(sizes) > 8
     ncols = 4
     nrows = math.ceil((len(kernels) + 1) / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(11, 2.35 * nrows + 0.6),
@@ -181,7 +240,8 @@ def fig_speedup_vs_size(kernels, sizes, speedup, ok, meta, outdir, formats):
             color, marker = SERIES[c]
             xs = [n for n in sizes if (k, c, n) in speedup]
             ys = [speedup[(k, c, n)] for n in xs]
-            ax.plot(xs, ys, color=color, linewidth=2, marker=marker, markersize=5,
+            ax.plot(xs, ys, color=color, linewidth=1.6 if dense else 2,
+                    marker=None if dense else marker, markersize=5,
                     markeredgecolor=SURFACE, markeredgewidth=1.2, zorder=3,
                     solid_capstyle="round", solid_joinstyle="round")
         title = KERNEL_TITLES.get(k, k)
@@ -189,17 +249,15 @@ def fig_speedup_vs_size(kernels, sizes, speedup, ok, meta, outdir, formats):
         if any(not ok.get((k, c, n), True) for c in series for n in sizes):
             ax.text(0.02, 0.04, "optimized code not executed", transform=ax.transAxes,
                     color=MUTED, fontsize=8)
-        ax.set_xscale("log", base=2)
-        ax.set_xticks(sizes)
-        ax.set_xticklabels([fmt_size(n) for n in sizes])
-        ax.minorticks_off()
+        size_ticks(ax, sizes)
         log_speedup_axis(ax, lo, hi)
     for ax in axes[len(kernels):]:
         ax.axis("off")
     # Legend in the first free panel.
     leg_ax = axes[len(kernels)]
-    handles = [Line2D([], [], color=SERIES[c][0], marker=SERIES[c][1], linewidth=2,
-                      markersize=6, markeredgecolor=SURFACE, label=LABELS[c]) for c in series]
+    handles = [Line2D([], [], color=SERIES[c][0], marker=None if dense else SERIES[c][1],
+                      linewidth=2, markersize=6, markeredgecolor=SURFACE, label=LABELS[c])
+               for c in series]
     handles.append(Line2D([], [], color=INK_2, linewidth=1.0, label="O3 = 1×"))
     leg_ax.legend(handles=handles, loc="center left", fontsize=9, labelcolor=INK)
     for ax in axes[(nrows - 1) * ncols:]:
@@ -311,7 +369,7 @@ def fig_geomean(kernels, configs, sizes, speedup, ok, meta, outdir, formats, cac
             vals.append(statistics.geometric_mean(rs) if rs else float("nan"))
         top = max([top] + [v for v in vals if v == v])
         xs = [i + (g - 0.5) * (bar_w + 0.03) for i in range(len(cols))]
-        sizes_txt = ", ".join(fmt_size(n) for n in ns)
+        sizes_txt = size_range(ns)
         ax.bar(xs, vals, width=bar_w, color=color, zorder=3,
                label=f"{name} ({sizes_txt} floats per array)")
         for x, v in zip(xs, vals):
@@ -332,6 +390,178 @@ def fig_geomean(kernels, configs, sizes, speedup, ok, meta, outdir, formats, cac
     header(fig, "Geometric-mean speedup per configuration", note)
     fig.tight_layout(rect=(0, 0, 1, 0.85))
     save(fig, outdir, "fig4_geomean", formats)
+
+
+def kernel_arrays(kernel):
+    """Number of arrays a kernel touches: the pointer (or vector) parameters of
+    its kernel_impl."""
+    try:
+        src = open(os.path.join(HERE, "kernels", kernel + ".cpp")).read()
+    except OSError:
+        return None
+    m = re.search(r"KERNEL\s+kernel_impl\((.*?)\)", src, re.S)
+    params = m.group(1) if m else ""
+    return params.count("__restrict") + params.count("Vec &") or None
+
+
+def cpu_caches(meta):
+    """{"L1": bytes, ...} from meta.txt, or from sysfs for older results."""
+    caches = {}
+    for item in meta.get("caches", "").split():
+        name, _, size = item.partition("=")
+        caches[name] = int(size)
+    if caches:
+        return caches
+    cpu = meta.get("cpu", "1").split()[0]
+    base = f"/sys/devices/system/cpu/cpu{cpu}/cache"
+    for idx in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+        d = os.path.join(base, idx)
+        if open(os.path.join(d, "type")).read().strip() == "Instruction":
+            continue
+        m = re.fullmatch(r"(\d+)([KM]?)", open(os.path.join(d, "size")).read().strip())
+        if m:
+            level = open(os.path.join(d, "level")).read().strip()
+            caches["L" + level] = int(m.group(1)) * {"": 1, "K": 1 << 10, "M": 1 << 20}[m.group(2)]
+    return caches
+
+
+def cache_lines(ax, kernel, caches, sizes, label):
+    """Vertical lines at the sizes where the kernel's arrays fill a cache level."""
+    arrays = kernel_arrays(kernel)
+    if not arrays:
+        return
+    for name, size in sorted(caches.items()):
+        n = size / (4 * arrays)
+        if not sizes[0] <= n <= sizes[-1]:
+            continue
+        ax.axvline(n, color=AXIS, linewidth=1.0, linestyle=(0, (4, 3)), zorder=1)
+        if label:
+            ax.text(n * 1.06, 1.0, name, transform=ax.get_xaxis_transform(), ha="left",
+                    va="top", fontsize=8, color=MUTED)
+
+
+def end_labels(ax, ends):
+    """Direct labels at the right end of the lines, pushed apart vertically."""
+    lo, hi = ax.get_ylim()
+    min_gap = 0.055 * (math.log2(hi) - math.log2(lo))  # About one text line, in log2 units.
+    placed = []
+    for c, y in sorted(ends, key=lambda e: e[1]):
+        ly = math.log2(y)
+        if placed and ly < placed[-1][1] + min_gap:
+            ly = placed[-1][1] + min_gap
+        placed.append((c, ly))
+    x = ax.get_xlim()[1]
+    for c, ly in placed:
+        ax.annotate(LABELS[c], (x, 2 ** ly), xytext=(4, 0), textcoords="offset points",
+                    va="center", ha="left", fontsize=8, color=INK_2, annotation_clip=False)
+
+
+def fig_kernel_sweep(results, outdir, formats):
+    """One figure per kernel, three panels over the same size axis: O3's time
+    per element, the speedup over O3 of the main configurations, and of the
+    ablations of offset-aware fusion. Dashed lines mark the sizes at which the
+    kernel's arrays fill L1, L2 and L3. Bands show the spread over the runs:
+    gray = O3 against itself (the noise floor), blue = offset-aware fusion."""
+    bench, times, ok, meta = load_runs(results)
+    kernels = list(dict.fromkeys(r["kernel"] for r in bench))
+    sizes = sorted({int(r["n"]) for r in bench})
+    runs = int(meta.get("runs", 1) or 1)
+    caches = cpu_caches(meta)
+    sweep_dir = os.path.join(outdir, "sweep")
+    os.makedirs(sweep_dir, exist_ok=True)
+
+    def median_speedup(k, c, n):
+        rs = run_speedups(times, k, c, n)
+        return statistics.median(rs) if rs else None
+
+    for k in kernels:
+        fig, (ax_t, ax_m, ax_a) = plt.subplots(
+            3, 1, figsize=(10, 10.5), sharex=True,
+            gridspec_kw={"height_ratios": (1, 2.3, 2.3), "hspace": 0.22})
+        fig.subplots_adjust(left=0.09, right=0.8, top=0.88, bottom=0.17)
+
+        # O3 time per element: shows where the cache levels start to matter.
+        xs = [n for n in sizes if (k, "O3", n) in times]
+        ys = [statistics.median(times[(k, "O3", n)].values()) / n for n in xs]
+        ax_t.plot(xs, ys, color=INK_2, linewidth=1.6, zorder=3)
+        ax_t.set_ylim(0, max(ys) * 1.2)
+        ax_t.set_ylabel("ns per element")
+        ax_t.grid(True, axis="y")
+        cache_lines(ax_t, k, caches, sizes, label=True)
+        ax_t.set_title("O3 time per element", loc="left", fontweight="semibold")
+
+        vals = []
+        labeled = []  # (axis, line ends): direct labels, placed once the limits are final.
+        for ax, series, title, direct in (
+                (ax_m, SWEEP_MAIN, "Speedup over O3: Polly configurations", True),
+                (ax_a, SWEEP_ABLATION, "Speedup over O3: ablations of offset-aware fusion",
+                 False)):
+            ax.grid(True, axis="y")
+            cache_lines(ax, k, caches, sizes, label=False)
+            if runs > 1:
+                # O3 against its own median: anything inside is run-to-run noise.
+                lo_hi = []
+                for n in xs:
+                    t = list(times[(k, "O3", n)].values())
+                    med = statistics.median(t)
+                    lo_hi.append((min(med / v for v in t), max(med / v for v in t)))
+                ax.fill_between(xs, [a for a, _ in lo_hi], [b for _, b in lo_hi],
+                                color=GRID, linewidth=0, zorder=1)
+                vals += [v for pair in lo_hi for v in pair]
+                band = [(n, run_speedups(times, k, "offset", n)) for n in sizes]
+                band = [(n, rs) for n, rs in band if rs]
+                if band:
+                    vals += [v for _, rs in band for v in (min(rs), max(rs))]
+                    ax.fill_between([n for n, _ in band], [min(rs) for _, rs in band],
+                                    [max(rs) for _, rs in band], color=SERIES["offset"][0],
+                                    alpha=0.16, linewidth=0, zorder=2)
+            ax.axhline(1.0, color=INK_2, linewidth=1.0, zorder=2)
+            ends = []
+            for c in reversed(series):  # The subject series (offset) on top.
+                pts = [(n, median_speedup(k, c, n)) for n in sizes]
+                pts = [(n, v) for n, v in pts if v]
+                if not pts:
+                    continue
+                ax.plot([n for n, _ in pts], [v for _, v in pts], color=SERIES[c][0],
+                        linewidth=2.2 if c == "offset" else 1.5,
+                        zorder=4 if c == "offset" else 3,
+                        solid_capstyle="round", solid_joinstyle="round")
+                vals += [v for _, v in pts]
+                ends.append((c, pts[-1][1]))
+            if any(not ok.get((k, c, n), True) for c in series for n in sizes):
+                ax.text(0.02, 0.04, "optimized code not executed", transform=ax.transAxes,
+                        color=MUTED, fontsize=8)
+            ax.set_title(title, loc="left", fontweight="semibold")
+            ax.set_ylabel("speedup over O3")
+            if direct:
+                labeled.append((ax, ends))
+        size_ticks(ax_a, sizes)
+        ax_a.set_xlabel("elements per array (4 B each)")
+        lo = max(1 / 32, 2 ** math.floor(math.log2(min(vals + [0.5]))))
+        hi = min(8, 2 ** math.ceil(math.log2(max(vals + [2.0]))))
+        for ax in (ax_m, ax_a):
+            log_speedup_axis(ax, lo, hi)
+        for ax, ends in labeled:
+            end_labels(ax, ends)
+
+        # One legend for both speedup panels; configurations keep their color.
+        configs = list(dict.fromkeys(SWEEP_MAIN + SWEEP_ABLATION))
+        handles = [Line2D([], [], color=SERIES[c][0], linewidth=2, label=LABELS[c])
+                   for c in configs]
+        handles.append(Line2D([], [], color=INK_2, linewidth=1.0, label="O3 = 1×"))
+        if runs > 1:
+            handles.append(Patch(color=GRID, label="O3 against itself (noise)"))
+            handles.append(Patch(color=SERIES["offset"][0], alpha=0.16,
+                                 label="offset: spread over runs"))
+        ax_a.legend(handles=handles, loc="upper left", bbox_to_anchor=(0, -0.14), ncol=4,
+                    fontsize=8, handlelength=1.6, columnspacing=1.4)
+
+        arrays = kernel_arrays(k)
+        note = subtitle(meta)
+        if arrays:
+            note += f".  Dashed: the {arrays} arrays (n × 4 B each) fill L1, L2, L3"
+        header(fig, f"{KERNEL_TITLES.get(k, k)}: speedup over O3 by array size", note)
+        save(fig, sweep_dir, k, formats)
 
 
 def write_table(kernels, configs, sizes, speedup, ok, outdir):
@@ -375,6 +605,7 @@ def main():
     fig_speedup_largest(kernels, sizes, speedup, ok, meta, outdir, formats)
     fig_ablation(kernels, configs, sizes, speedup, ok, meta, outdir, formats, args.cache_size)
     fig_geomean(kernels, configs, sizes, speedup, ok, meta, outdir, formats, args.cache_size)
+    fig_kernel_sweep(results, outdir, formats)
     write_table(kernels, configs, sizes, speedup, ok, outdir)
     print(f"figures written to {outdir}")
 

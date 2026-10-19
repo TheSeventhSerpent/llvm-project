@@ -15,6 +15,7 @@ import argparse
 import concurrent.futures
 import csv
 import datetime
+import itertools
 import os
 import re
 import shutil
@@ -192,6 +193,34 @@ def read_file(path, default="?"):
         return default
 
 
+def sweep_sizes():
+    """1K to 16M elements, four sizes per octave (2^(k/4), rounded to a multiple
+    of 16). The powers of two are included; the sizes between them show whether
+    a jump at a power of two is an alignment effect or a cache-size effect."""
+    sizes = []
+    for k in range(10 * 4, 24 * 4 + 1):
+        n = round(2 ** (k / 4) / 16) * 16
+        if not sizes or n != sizes[-1]:
+            sizes.append(n)
+    return sizes
+
+
+def cache_sizes(cpu):
+    """{"L1": bytes, "L2": bytes, "L3": bytes} of the data caches of @p cpu."""
+    caches = {}
+    base = f"/sys/devices/system/cpu/cpu{cpu}/cache"
+    for idx in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+        d = os.path.join(base, idx)
+        if read_file(os.path.join(d, "type")) == "Instruction":
+            continue
+        size = read_file(os.path.join(d, "size"))
+        m = re.fullmatch(r"(\d+)([KM]?)", size)
+        if m:
+            caches["L" + read_file(os.path.join(d, "level"))] = \
+                int(m.group(1)) * {"": 1, "K": 1 << 10, "M": 1 << 20}[m.group(2)]
+    return caches
+
+
 def main():
     kernels_all = sorted(f[:-4] for f in os.listdir(os.path.join(HERE, "kernels"))
                          if f.endswith(".cpp"))
@@ -202,8 +231,12 @@ def main():
     ap.add_argument("--configs", default=",".join(CONFIGS),
                     help="comma-separated configurations (default: all)")
     ap.add_argument("--sizes", default="1024,16384,262144,4194304,16777216",
-                    help="benchmark sizes (elements per array)")
+                    help="benchmark sizes (elements per array), or `sweep` for 1K to 16M "
+                         "with four sizes per octave")
     ap.add_argument("--reps", type=int, default=11, help="benchmark repetitions")
+    ap.add_argument("--runs", type=int, default=1,
+                    help="repeat all benchmarks this many times, interleaved; results "
+                         "use the median over the runs, plots also show their spread")
     ap.add_argument("--no-bench", action="store_true", help="only check correctness")
     ap.add_argument("--perf", action="store_true",
                     help="also record cache misses with perf stat")
@@ -225,7 +258,9 @@ def main():
     for k in kernels:
         if k not in kernels_all:
             fail(f"unknown kernel {k}")
-    sizes = [int(s) for s in args.sizes.split(",")]
+    sizes = sweep_sizes() if args.sizes == "sweep" else [int(s) for s in args.sizes.split(",")]
+    if args.runs < 1:
+        fail("--runs must be at least 1")
     cpu = pick_cpu() if args.cpu is None else args.cpu
     if args.perf and not perf_usable():
         fail("perf stat is not usable; try `sudo sysctl kernel.perf_event_paranoid=1`")
@@ -243,6 +278,8 @@ def main():
         "governor": governor,
         "cflags": " ".join(args.cflags),
         "reps": args.reps,
+        "runs": args.runs,
+        "caches": " ".join(f"{k}={v}" for k, v in cache_sizes(cpu).items()),
     }
     with open(os.path.join(outdir, "meta.txt"), "w") as f:
         for k, v in meta.items():
@@ -302,43 +339,50 @@ def main():
     # 5. Benchmarks.
     bench = []
     if not args.no_bench:
+        # The optimized code must be used at every benchmark size (section 9.3).
+        path_ok = {}
         for k in kernels:
             for c in configs:
                 b = builds[(k, c)]
                 for n in sizes:
-                    # The optimized code must be used at this size (section 9.3).
-                    path_ok = True
+                    path_ok[(k, c, n)] = True
                     if b.uses_polly:
                         out = sh([b.bin_rtc, "bench", str(n), "0"]).stdout
                         prints = [m for m in RTC_RE.finditer(out) if m.group(1) == "kernel_impl"]
-                        path_ok = bool(prints) and all(
+                        path_ok[(k, c, n)] = bool(prints) and all(
                             m.group(2) == "-1" and m.group(3) == "-1" for m in prints)
-                    cmd = ["taskset", "-c", str(cpu), b.bin, "bench", str(n), str(args.reps)]
-                    row = {"kernel": k, "config": c, "n": n}
-                    if args.perf:
-                        cmd = ["perf", "stat", "-x,", "-e",
-                               "cache-misses,L1-dcache-load-misses"] + cmd
-                    r = sh(cmd)
-                    m = re.search(r"median_ns=(\d+) min_ns=(\d+)", r.stdout)
-                    if not m:
-                        fail(f"{k}/{c}: benchmark failed:\n{r.stdout}{r.stderr}")
-                    row["median_ns"] = int(m.group(1))
-                    row["min_ns"] = int(m.group(2))
-                    row["ns_per_elem"] = round(int(m.group(1)) / max(n, 1), 4)
-                    if args.perf:
-                        # Counters cover all REPS + 1 runs and the initialization.
-                        for line in r.stderr.splitlines():
-                            parts = line.split(",")
-                            if len(parts) > 2 and parts[2] in ("cache-misses",
-                                                               "L1-dcache-load-misses"):
-                                row[parts[2]] = parts[0]
-                    row["polly_path"] = int(path_ok) if b.uses_polly else ""
-                    if b.uses_polly and not path_ok and not b.nopolly:
-                        problems.append(f"{k}/{c}: Polly code not executed at n={n}")
-                    bench.append(row)
-                    print(f"  {k:18s} {c:12s} n={n:<9d} {row['ns_per_elem']:.3f} ns/elem",
-                          file=sys.stderr)
-        fields = ["kernel", "config", "n", "median_ns", "min_ns", "ns_per_elem", "polly_path"]
+                        if not path_ok[(k, c, n)] and not b.nopolly:
+                            problems.append(f"{k}/{c}: Polly code not executed at n={n}")
+        # Runs are interleaved, and all configurations of a kernel are measured
+        # back to back at each size, so that slow drifts (temperature, frequency)
+        # affect O3 and the configurations alike.
+        for run, k, n, c in itertools.product(range(args.runs), kernels, sizes, configs):
+            b = builds[(k, c)]
+            cmd = ["taskset", "-c", str(cpu), b.bin, "bench", str(n), str(args.reps)]
+            row = {"run": run, "kernel": k, "config": c, "n": n}
+            if args.perf:
+                cmd = ["perf", "stat", "-x,", "-e",
+                       "cache-misses,L1-dcache-load-misses"] + cmd
+            r = sh(cmd)
+            m = re.search(r"median_ns=(\d+) min_ns=(\d+)", r.stdout)
+            if not m:
+                fail(f"{k}/{c}: benchmark failed:\n{r.stdout}{r.stderr}")
+            row["median_ns"] = int(m.group(1))
+            row["min_ns"] = int(m.group(2))
+            row["ns_per_elem"] = round(int(m.group(1)) / max(n, 1), 4)
+            if args.perf:
+                # Counters cover all REPS + 1 runs and the initialization.
+                for line in r.stderr.splitlines():
+                    parts = line.split(",")
+                    if len(parts) > 2 and parts[2] in ("cache-misses",
+                                                       "L1-dcache-load-misses"):
+                        row[parts[2]] = parts[0]
+            row["polly_path"] = int(path_ok[(k, c, n)]) if b.uses_polly else ""
+            bench.append(row)
+            print(f"  run {run + 1}/{args.runs} {k:18s} {c:12s} n={n:<9d} "
+                  f"{row['ns_per_elem']:.3f} ns/elem", file=sys.stderr)
+        fields = ["run", "kernel", "config", "n", "median_ns", "min_ns", "ns_per_elem",
+                  "polly_path"]
         if args.perf:
             fields += ["cache-misses", "L1-dcache-load-misses"]
         with open(os.path.join(outdir, "bench.csv"), "w", newline="") as f:
@@ -377,8 +421,18 @@ def write_summary(outdir, meta, kernels, configs, sizes, rows, bench, problems):
             cells.append(cell)
         L.append(f"| {k} | " + " | ".join(cells) + " |")
     if bench:
+        runs = len({r["run"] for r in bench})
         L += ["", "## Speedup over O3 (median time, higher is better)", ""]
-        bb = {(r["kernel"], r["config"], r["n"]): r for r in bench}
+        if runs > 1:
+            L += [f"Times are the median over {runs} runs.", ""]
+        # Median over the runs of each benchmark.
+        bb = {}
+        for r in bench:
+            bb.setdefault((r["kernel"], r["config"], r["n"]), []).append(r)
+        for key, rs in bb.items():
+            median_ns = statistics.median(r["median_ns"] for r in rs)
+            bb[key] = {**rs[0], "median_ns": median_ns,
+                       "ns_per_elem": median_ns / max(key[2], 1)}
         for n in sizes:
             L += [f"### n = {n}", ""]
             L.append("| kernel | O3 ns/elem | " + " | ".join(c for c in configs if c != "O3") + " |")
